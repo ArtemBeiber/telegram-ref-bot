@@ -12,7 +12,7 @@ from db_manager import (
     create_or_update_customer, get_customer, accrue_bonuses_for_order
 ) 
 # Используем БД для хранения времени синхронизации
-from db_manager import get_last_sync_timestamp, set_last_sync_timestamp 
+from db_manager import get_last_sync_timestamp, set_last_sync_timestamp, get_last_order_date, set_last_order_date 
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,16 +22,21 @@ OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 def transform_ozon_customer_data(posting: Dict) -> Dict:
     """Преобразует данные клиента из Ozon API в словарь для записи в DB.
     
-    ВАЖНО: buyer_id извлекается из posting_number (первые цифры до первого тире).
-    Например: posting_number = "10054917-1093-1" -> buyer_id = "10054917"
+    ВАЖНО: buyer_id извлекается из posting_number:
+    - Если есть тире: первые цифры до первого тире (например: "10054917-1093-1" -> "10054917")
+    - Если тире нет: весь posting_number и есть buyer_id
     """
     
     posting_number = posting.get("posting_number", "")
     
     # Извлекаем buyer_id из posting_number (первые цифры до первого тире)
+    # Если тире нет, то весь posting_number и есть buyer_id
     buyer_id = ""
-    if posting_number and "-" in posting_number:
-        buyer_id = posting_number.split("-")[0]
+    if posting_number:
+        if "-" in posting_number:
+            buyer_id = posting_number.split("-")[0]
+        else:
+            buyer_id = posting_number
     
     if not buyer_id:
         return None
@@ -106,9 +111,13 @@ def transform_ozon_data_for_sheets(posting: Dict, item: Dict) -> Dict:
     created_at = posting.get("created_at", "")
     
     # Извлекаем buyer_id из posting_number (первые цифры до первого тире)
+    # Если тире нет, то весь posting_number и есть buyer_id
     buyer_id = ""
-    if posting_number and "-" in posting_number:
-        buyer_id = posting_number.split("-")[0]
+    if posting_number:
+        if "-" in posting_number:
+            buyer_id = posting_number.split("-")[0]
+        else:
+            buyer_id = posting_number
 
     # Данные товара
     item_name = item.get("name", "")
@@ -289,13 +298,16 @@ def fetch_new_orders_from_api(
 
 def get_last_synced_time() -> datetime:
     """
-    Возвращает время последней синхронизации из базы данных.
+    Возвращает дату последнего заказа из базы данных (для определения стартовой даты запроса к API).
     Если это первый запуск, возвращает 01.12.2025.
-    """
-    last_sync = get_last_sync_timestamp()
     
-    if last_sync:
-        return last_sync
+    ВАЖНО: Эта функция используется для алгоритма скользящей даты и определения стартовой даты запроса.
+    Она возвращает дату последнего заказа, а не время синхронизации.
+    """
+    last_order_date = get_last_order_date()
+    
+    if last_order_date:
+        return last_order_date
     else:
         # Если в БД пусто (первый запуск), начинаем скачивать данные с 01.12.2025
         default_sync_time = datetime(2025, 12, 1)
@@ -733,8 +745,11 @@ def update_orders_sheet():
             # Нет заказов - используем текущую дату без смещения
             new_last_synced_time = datetime.now()
         
-        # Сохраняем новую дату синхронизации
-        set_last_sync_timestamp(new_last_synced_time)
+        # Сохраняем время последней синхронизации (для проверки интервала 12 часов)
+        set_last_sync_timestamp(sync_start_time)
+        
+        # Сохраняем дату последнего заказа (для алгоритма скользящей даты и определения стартовой даты следующего запроса)
+        set_last_order_date(new_last_synced_time)
 
         if new_records_count > 0 or new_customers_count > 0:
             print(f"Успешно добавлено {new_records_count} новых заказов в базу данных.")
@@ -809,185 +824,6 @@ def get_orders_status_stats_by_date(date: datetime) -> Dict:
         }
     finally:
         db.close()
-
-def fill_customers_from_existing_orders():
-    """Заполняет таблицу customers на основе существующих заказов в базе данных.
-    
-    Эта функция проходит по всем заказам в таблице orders, извлекает buyer_id
-    из posting_number и создает/обновляет записи в таблице customers.
-    
-    Returns:
-        dict: Статистика обработки {"processed_orders": X, "customers_created": Y, "customers_updated": Z, "total_customers": W}
-    """
-    db_generator = get_db()
-    db = next(db_generator)
-    
-    try:
-        # Получаем все заказы из базы данных
-        all_orders = db.query(Order).all()
-        
-        # Словарь для группировки заказов по buyer_id
-        # Ключ: buyer_id, значение: список заказов
-        orders_by_buyer = {}
-        
-        # Словарь для хранения данных клиентов
-        # Ключ: buyer_id, значение: словарь с данными клиента
-        customers_data = {}
-        
-        processed_orders = 0
-        
-        # Проходим по всем заказам
-        for order in all_orders:
-            # Извлекаем buyer_id из posting_number, если его нет в поле buyer_id
-            buyer_id = order.buyer_id
-            
-            if not buyer_id and order.posting_number:
-                # Извлекаем buyer_id из posting_number (первые цифры до первого тире)
-                if "-" in order.posting_number:
-                    buyer_id = order.posting_number.split("-")[0]
-                    # Обновляем buyer_id в заказе
-                    order.buyer_id = buyer_id
-                    processed_orders += 1
-            
-            if not buyer_id:
-                continue
-            
-            # Группируем заказы по buyer_id
-            if buyer_id not in orders_by_buyer:
-                orders_by_buyer[buyer_id] = []
-            orders_by_buyer[buyer_id].append(order)
-            
-            # Собираем данные о клиенте из заказа
-            if buyer_id not in customers_data:
-                customers_data[buyer_id] = {
-                    "buyer_id": buyer_id,
-                    "name": "",  # Эти данные обычно не хранятся в orders
-                    "phone": "",
-                    "email": "",
-                    "address": order.address or "",
-                    "delivery_region": order.delivery_region or "",
-                    "delivery_city": order.delivery_city or "",
-                    "cluster_to": order.cluster_to or "",
-                    "client_segment": order.client_segment or "",
-                    "is_legal_entity": order.is_legal_entity or "",
-                    "payment_method": order.payment_method or "",
-                    "total_spent": 0.0,
-                    "first_order_date": None,
-                    "last_order_date": None,
-                }
-            
-            # Обновляем данные, если они есть в заказе
-            if order.address and not customers_data[buyer_id]["address"]:
-                customers_data[buyer_id]["address"] = order.address
-            if order.delivery_region and not customers_data[buyer_id]["delivery_region"]:
-                customers_data[buyer_id]["delivery_region"] = order.delivery_region
-            if order.delivery_city and not customers_data[buyer_id]["delivery_city"]:
-                customers_data[buyer_id]["delivery_city"] = order.delivery_city
-            if order.cluster_to and not customers_data[buyer_id]["cluster_to"]:
-                customers_data[buyer_id]["cluster_to"] = order.cluster_to
-            if order.client_segment and not customers_data[buyer_id]["client_segment"]:
-                customers_data[buyer_id]["client_segment"] = order.client_segment
-            if order.is_legal_entity and not customers_data[buyer_id]["is_legal_entity"]:
-                customers_data[buyer_id]["is_legal_entity"] = order.is_legal_entity
-            if order.payment_method and not customers_data[buyer_id]["payment_method"]:
-                customers_data[buyer_id]["payment_method"] = order.payment_method
-        
-        # Подсчитываем статистику для каждого клиента
-        customers_created = 0
-        customers_updated = 0
-        
-        for buyer_id, customer_info in customers_data.items():
-            orders_list = orders_by_buyer.get(buyer_id, [])
-            
-            # Подсчитываем количество заказов и общую сумму
-            total_orders = len(orders_list)
-            total_spent = 0.0
-            first_order_date = None
-            last_order_date = None
-            
-            for order in orders_list:
-                # Суммируем потраченную сумму
-                try:
-                    price = float(order.price_amount or 0)
-                    total_spent += price
-                except (ValueError, TypeError):
-                    pass
-                
-                # Определяем даты первого и последнего заказа
-                if order.created_at:
-                    if first_order_date is None or order.created_at < first_order_date:
-                        first_order_date = order.created_at
-                    if last_order_date is None or order.created_at > last_order_date:
-                        last_order_date = order.created_at
-            
-            # Обновляем данные клиента
-            customer_info["total_orders"] = total_orders
-            customer_info["total_spent"] = str(total_spent)
-            customer_info["first_order_date"] = first_order_date
-            customer_info["last_order_date"] = last_order_date
-            
-            # Удаляем служебные ключи, которые не являются полями модели Customer
-            # Ключ "orders" используется только для внутренней логики
-            customer_info_clean = {k: v for k, v in customer_info.items() if k != "orders"}
-            
-            # Создаем или обновляем запись в таблице customers
-            existing_customer = get_customer(db, buyer_id)
-            
-            if existing_customer:
-                # Обновляем существующего клиента
-                existing_customer.total_orders = total_orders
-                existing_customer.total_spent = str(total_spent)
-                existing_customer.first_order_date = first_order_date
-                existing_customer.last_order_date = last_order_date
-                
-                # Обновляем другие поля, если они пустые
-                if not existing_customer.address and customer_info_clean.get("address"):
-                    existing_customer.address = customer_info_clean["address"]
-                if not existing_customer.delivery_region and customer_info_clean.get("delivery_region"):
-                    existing_customer.delivery_region = customer_info_clean["delivery_region"]
-                if not existing_customer.delivery_city and customer_info_clean.get("delivery_city"):
-                    existing_customer.delivery_city = customer_info_clean["delivery_city"]
-                if not existing_customer.cluster_to and customer_info_clean.get("cluster_to"):
-                    existing_customer.cluster_to = customer_info_clean["cluster_to"]
-                if not existing_customer.client_segment and customer_info_clean.get("client_segment"):
-                    existing_customer.client_segment = customer_info_clean["client_segment"]
-                if not existing_customer.is_legal_entity and customer_info_clean.get("is_legal_entity"):
-                    existing_customer.is_legal_entity = customer_info_clean["is_legal_entity"]
-                if not existing_customer.payment_method and customer_info_clean.get("payment_method"):
-                    existing_customer.payment_method = customer_info_clean["payment_method"]
-                
-                customers_updated += 1
-            else:
-                # Создаем нового клиента - используем очищенный словарь
-                create_or_update_customer(db, customer_info_clean)
-                customers_created += 1
-        
-        # Сохраняем изменения в базе данных
-        db.commit()
-        
-        return {
-            "processed_orders": processed_orders,
-            "customers_created": customers_created,
-            "customers_updated": customers_updated,
-            "total_customers": len(customers_data)
-        }
-        
-    except Exception as e:
-        db.rollback()
-        print(f"Ошибка при заполнении таблицы customers: {e}")
-        raise
-    finally:
-        db.close()
-        
-    sync_end_time = datetime.now()
-    return {
-        "count": 0,
-        "period_start": date_since,
-        "period_end": sync_end_time,
-        "customers_count": 0,
-        "new_customers_count": 0,
-        "participants_with_orders_count": 0
-    }
 
 if __name__ == "__main__":
     result = update_orders_sheet()

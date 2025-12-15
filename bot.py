@@ -28,7 +28,7 @@ from db_manager import (
 
 from states import Registration, BonusSettings
 # ИМПОРТ ДЛЯ СИНХРОНИЗАЦИИ ЗАКАЗОВ
-from orders_updater import update_orders_sheet, fill_customers_from_existing_orders 
+from orders_updater import update_orders_sheet 
 
 # грузим переменные из .env
 from datetime import datetime, timedelta
@@ -93,20 +93,16 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="🔄 Синхронизировать заказы"),
                 KeyboardButton(text="📊 Моя статистика"),
-            ],
-            [
                 KeyboardButton(text="📦 Мои заказы"),
+            ],
+            [
                 KeyboardButton(text="👥 Управление"),
-            ],
-            [
                 KeyboardButton(text="📈 Аналитика"),
-                KeyboardButton(text="⚙️ Настройки"),
             ],
             [
+                KeyboardButton(text="⚙️ Настройки"),
                 KeyboardButton(text="👥 Пригласить друга"),
-                KeyboardButton(text="🔄 Заполнить старые клиенты"),
             ],
             [
                 KeyboardButton(text="❓ Помощь"),
@@ -312,19 +308,6 @@ async def sync_orders_handler(message: types.Message):
 # =========================================================
 # ОБРАБОТЧИКИ КНОПОК КЛАВИАТУРЫ
 # =========================================================
-@dp.message(lambda message: message.text == "🔄 Синхронизировать заказы")
-async def sync_orders_button_handler(message: types.Message):
-    """Обработчик кнопки 'Синхронизировать заказы'."""
-    
-    # Проверка прав администратора
-    if not is_admin(message.from_user.id):
-        await message.answer(
-            "❌ У тебя нет прав для выполнения этой команды.",
-            reply_markup=get_keyboard(message.from_user.id)
-        )
-        return
-    await sync_orders_handler(message)
-
 @dp.message(lambda message: message.text == "📊 Моя статистика")
 async def my_stats_handler(message: types.Message):
     """Обработчик кнопки 'Моя статистика'."""
@@ -520,7 +503,7 @@ async def help_handler(message: types.Message):
     )
     
     if is_admin_user:
-        text += "/sync_orders - Синхронизировать заказы (только для админов)\n"
+        text += "/sync_orders - Синхронизировать заказы вручную (экстренный случай, только для админов)\n"
     
     text += "/test_db - Проверить подключение к БД\n\n"
     text += "Или используй кнопки ниже для быстрого доступа к функциям."
@@ -740,47 +723,15 @@ async def process_editing_percent(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введи число (можно с точкой, например: 5.5). Попробуй еще раз:")
 
-@dp.message(lambda message: message.text == "🔄 Заполнить старые клиенты")
-async def fill_old_customers_handler(message: types.Message):
-    """Обработчик для заполнения таблицы customers из существующих заказов."""
-    user_id = message.from_user.id
-    
-    if not is_admin(user_id):
-        await message.answer(
-            "❌ У тебя нет прав для выполнения этой команды",
-            reply_markup=get_keyboard(user_id)
-        )
-        return
-    
-    await message.answer("⏳ Начинаю обработку старых заказов...", reply_markup=get_keyboard(user_id))
-    
-    try:
-        result = await asyncio.to_thread(fill_customers_from_existing_orders)
-        
-        text = (
-            f"✅ Обработка завершена!\n\n"
-            f"📦 Обработано заказов: <b>{result['processed_orders']}</b>\n"
-            f"👥 Создано клиентов: <b>{result['customers_created']}</b>\n"
-            f"🔄 Обновлено клиентов: <b>{result['customers_updated']}</b>\n"
-            f"📊 Всего уникальных клиентов: <b>{result['total_customers']}</b>"
-        )
-        
-        await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
-    except Exception as e:
-        await message.answer(
-            f"❌ Ошибка при обработке: {str(e)}",
-            reply_markup=get_keyboard(user_id)
-        )
-
 # =========================================================
 # 4. ОБРАБОТЧИК СОСТОЯНИЯ (Получение Ozon ID)
 # =========================================================
 @dp.message(Registration.waiting_for_ozon_id)
 async def process_ozon_id(message: types.Message, state: FSMContext):
     # Проверяем, не нажата ли кнопка вместо ввода ID
-    button_texts = ["🔄 Синхронизировать заказы", "📊 Моя статистика", "📦 Мои заказы", 
+    button_texts = ["📊 Моя статистика", "📦 Мои заказы", 
                      "❓ Помощь", "👥 Управление", "📈 Аналитика", "⚙️ Настройки", 
-                     "👥 Пригласить друга", "🔄 Заполнить старые клиенты"]
+                     "👥 Пригласить друга"]
     if message.text in button_texts:
         # Если нажата кнопка, обрабатываем её соответствующим обработчиком
         return
@@ -882,8 +833,8 @@ async def perform_auto_sync(notify_admins: bool = False) -> bool:
         if isinstance(result, dict) and result.get("count", 0) >= 0:
             print(f"✅ Автоматическая синхронизация завершена успешно. Добавлено заказов: {result.get('count', 0)}")
             
-            # Уведомляем админов, если запрошено
-            if notify_admins and result.get("count", 0) > 0:
+            # Уведомляем админов всегда, если запрошено (даже если заказов нет)
+            if notify_admins:
                 await notify_admins_about_sync(result)
             
             return True
@@ -904,25 +855,78 @@ async def perform_auto_sync(notify_admins: bool = False) -> bool:
         _sync_in_progress = False
 
 async def notify_admins_about_sync(result: dict):
-    """Отправляет уведомление админам об успешной синхронизации."""
+    """Отправляет уведомление админам об успешной синхронизации с детальной статистикой."""
     global bot
     try:
         period_start = result.get("period_start")
         period_end = result.get("period_end")
         
-        if period_start and period_end:
-            period_start_str = period_start.strftime("%d.%m.%Y %H:%M")
-            period_end_str = period_end.strftime("%d.%m.%Y %H:%M")
-        else:
+        if period_start is None or period_end is None:
             period_start_str = "не указано"
             period_end_str = "не указано"
+        else:
+            period_start_str = period_start.strftime("%d.%m.%Y %H:%M")
+            period_end_str = period_end.strftime("%d.%m.%Y %H:%M")
         
-        text = (
-            f"🤖 <b>Автоматическая синхронизация завершена</b>\n\n"
-            f"✅ Добавлено <b>{result.get('count', 0)}</b> новых заказов\n"
-            f"👥 Обработано <b>{result.get('customers_count', 0)}</b> клиентов\n"
-            f"📅 Период: {period_start_str} - {period_end_str}"
-        )
+        # Получаем статистику по статусам за первый день периода
+        first_day_stats = result.get("first_day_stats", {})
+        
+        # Формируем строку со статистикой по статусам
+        status_stats_text = ""
+        if first_day_stats and first_day_stats.get("total", 0) > 0:
+            # Извлекаем дату из period_start_str (формат: "DD.MM.YYYY HH:MM")
+            if period_start_str != "не указано" and " " in period_start_str:
+                first_day_date = period_start_str.split()[0]
+            elif period_start_str != "не указано":
+                first_day_date = period_start_str
+            else:
+                first_day_date = ""
+            
+            if first_day_date:
+                status_stats_text = f"\n\n📊 <b>Статистика за {first_day_date}:</b>\n"
+                status_stats_text += f"Всего заказов: <b>{first_day_stats['total']}</b>\n"
+                
+                statuses = first_day_stats.get("statuses", {})
+                if statuses:
+                    # Сортируем по количеству (от большего к меньшему)
+                    sorted_statuses = sorted(statuses.items(), key=lambda x: x[1], reverse=True)
+                    for status, count in sorted_statuses:
+                        percentage = (count / first_day_stats['total']) * 100
+                        status_name = {
+                            "delivered": "✅ Доставлено",
+                            "delivering": "🚚 В доставке",
+                            "awaiting_packaging": "📦 Ожидает упаковки",
+                            "awaiting_deliver": "⏳ Ожидает доставки",
+                            "cancelled": "❌ Отменено"
+                        }.get(status, status)
+                        status_stats_text += f"{status_name}: <b>{count}</b> ({percentage:.1f}%)\n"
+                
+                if first_day_stats.get("active_count", 0) > 0:
+                    status_stats_text += f"\n⚠️ Активных заказов: <b>{first_day_stats['active_count']}</b>"
+        
+        # Формируем основное сообщение
+        if result.get("count", 0) > 0:
+            text = (
+                f"🤖 <b>Автоматическая синхронизация завершена</b>\n\n"
+                f"🎉 Добавлено <b>{result.get('count', 0)}</b> новых заказов\n"
+                f"👥 Обработано <b>{result.get('customers_count', 0)}</b> клиентов "
+                f"(новых: <b>{result.get('new_customers_count', 0)}</b>)\n"
+                f"🎯 Участников программы совершивших покупку: <b>{result.get('participants_with_orders_count', 0)}</b>\n\n"
+                f"📅 <b>Период синхронизации:</b>\n"
+                f"С: {period_start_str}\n"
+                f"По: {period_end_str}"
+                f"{status_stats_text}"
+            )
+        else:
+            text = (
+                f"🤖 <b>Автоматическая синхронизация завершена</b>\n\n"
+                f"✅ Новых заказов не найдено\n\n"
+                f"📅 <b>Период проверки:</b>\n"
+                f"С: {period_start_str}\n"
+                f"По: {period_end_str}\n\n"
+                f"💡 Все заказы уже синхронизированы"
+                f"{status_stats_text}"
+            )
         
         for admin_id in ADMIN_IDS:
             try:
@@ -936,9 +940,12 @@ async def notify_admins_about_sync_error(error_msg: str):
     """Отправляет уведомление админам об ошибке синхронизации."""
     global bot
     try:
+        error_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         text = (
             f"❌ <b>Ошибка автоматической синхронизации</b>\n\n"
-            f"<code>{error_msg}</code>"
+            f"<code>{error_msg}</code>\n\n"
+            f"⏰ Время ошибки: {error_time}\n\n"
+            f"💡 Попробуйте проверить подключение к интернету или выполнить синхронизацию вручную командой /sync_orders"
         )
         
         for admin_id in ADMIN_IDS:

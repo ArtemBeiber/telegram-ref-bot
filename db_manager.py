@@ -804,7 +804,7 @@ def get_referrals_bonuses_stats(referral_ozon_ids: list, level: int) -> float:
 
 # >>> ФУНКЦИИ ДЛЯ РАБОТЫ С НАСТРОЙКАМИ СИНХРОНИЗАЦИИ <<<
 def get_last_sync_timestamp() -> datetime | None:
-    """Возвращает время последней успешной синхронизации из базы данных."""
+    """Возвращает время последней успешной синхронизации из базы данных (для проверки интервала 12 часов)."""
     db = SessionLocal()
     try:
         setting = db.query(SyncSettings).filter(SyncSettings.key == "last_sync_time").first()
@@ -818,7 +818,7 @@ def get_last_sync_timestamp() -> datetime | None:
         db.close()
 
 def set_last_sync_timestamp(timestamp: datetime):
-    """Записывает время последней успешной синхронизации в базу данных."""
+    """Записывает время последней успешной синхронизации в базу данных (для проверки интервала 12 часов)."""
     db = SessionLocal()
     try:
         setting = db.query(SyncSettings).filter(SyncSettings.key == "last_sync_time").first()
@@ -836,6 +836,43 @@ def set_last_sync_timestamp(timestamp: datetime):
     except Exception as e:
         db.rollback()
         print(f"Ошибка записи времени синхронизации: {e}")
+        raise e
+    finally:
+        db.close()
+
+def get_last_order_date() -> datetime | None:
+    """Возвращает дату последнего заказа из базы данных (для алгоритма скользящей даты и определения стартовой даты запроса)."""
+    db = SessionLocal()
+    try:
+        setting = db.query(SyncSettings).filter(SyncSettings.key == "last_order_date").first()
+        if setting and setting.value:
+            try:
+                return datetime.strptime(setting.value, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+        return None
+    finally:
+        db.close()
+
+def set_last_order_date(order_date: datetime):
+    """Записывает дату последнего заказа в базу данных (для алгоритма скользящей даты и определения стартовой даты запроса)."""
+    db = SessionLocal()
+    try:
+        setting = db.query(SyncSettings).filter(SyncSettings.key == "last_order_date").first()
+        date_str = order_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        if setting:
+            setting.value = date_str
+            setting.updated_at = datetime.utcnow()
+        else:
+            setting = SyncSettings(key="last_order_date", value=date_str)
+            db.add(setting)
+        
+        db.commit()
+        print(f"Дата последнего заказа обновлена до: {date_str}")
+    except Exception as e:
+        db.rollback()
+        print(f"Ошибка записи даты последнего заказа: {e}")
         raise e
     finally:
         db.close()
