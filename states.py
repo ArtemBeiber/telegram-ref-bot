@@ -6,3 +6,6 @@ class Registration(StatesGroup):
 class BonusSettings(StatesGroup):
     editing_levels = State()
     editing_percent = State()
+
+class LeavingProgram(StatesGroup):
+    confirming_leave = State()

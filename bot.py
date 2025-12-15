@@ -14,6 +14,7 @@ from db_manager import (
     find_participant_by_telegram_id,
     find_participant_by_ozon_id,
     create_participant,
+    delete_participant,
     create_database,
     get_user_orders_stats,
     get_referrals_by_level,
@@ -26,7 +27,7 @@ from db_manager import (
     get_last_sync_timestamp,
 )
 
-from states import Registration, BonusSettings
+from states import Registration, BonusSettings, LeavingProgram
 # ИМПОРТ ДЛЯ СИНХРОНИЗАЦИИ ЗАКАЗОВ
 from orders_updater import update_orders_sheet 
 
@@ -80,6 +81,9 @@ def get_user_keyboard() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text="👥 Пригласить друга"),
                 KeyboardButton(text="❓ Помощь"),
+            ],
+            [
+                KeyboardButton(text="🚪 Выйти из программы"),
             ],
         ],
         resize_keyboard=True,
@@ -147,6 +151,9 @@ async def start_handler(message: types.Message, state: FSMContext):
             )
             if referrer_participant:
                 referrer_ozon_id = referrer_participant.get("Ozon ID")
+                print(f"✅ Реферер найден при /start: Telegram ID={referrer_telegram_id}, Ozon ID={referrer_ozon_id}")
+            else:
+                print(f"⚠️ Реферер не найден при /start: Telegram ID={referrer_telegram_id} (будет попытка найти при регистрации)")
 
     # пробуем найти участника по Telegram ID
     # ИСПРАВЛЕНО: Оборачиваем синхронную функцию Sheets в asyncio.to_thread
@@ -164,8 +171,11 @@ async def start_handler(message: types.Message, state: FSMContext):
         return
 
     # нового участника ещё нет — начинаем регистрацию
-    # Сохраняем Ozon ID реферера, если он был найден
-    await state.update_data(referrer_id=referrer_ozon_id)
+    # Сохраняем Ozon ID реферера (если найден) и Telegram ID (для повторной попытки поиска)
+    await state.update_data(
+        referrer_id=referrer_ozon_id,
+        referrer_telegram_id=referrer_telegram_id
+    )
 
     text = (
         f"Привет, {first_name or username or 'друг'}! 👋\n\n"
@@ -486,29 +496,96 @@ async def invite_friend_handler(message: types.Message):
 
 @dp.message(lambda message: message.text == "❓ Помощь")
 async def help_handler(message: types.Message):
-    """Обработчик кнопки 'Помощь'."""
-    user_id = message.from_user.id
-    is_admin_user = is_admin(user_id)
-    
+    """Обработчик кнопки 'Помощь' - показывает главное меню помощи."""
+    await show_help_main_menu(message)
+
+async def show_help_main_menu(message_or_callback):
+    """Показывает главное меню помощи с подразделами."""
     text = (
         "❓ <b>Помощь</b>\n\n"
-        "📝 <b>Как найти свой Ozon ID?</b>\n\n"
-        "Твой Ozon ID — это первые цифры номера любого твоего заказа до тире.\n\n"
-        "<b>Пример:</b>\n"
-        "• Номер заказа: 10054917-1093-1\n"
-        "• Твой Ozon ID: 10054917\n\n"
-        "💡 <b>Совет:</b> Можешь отправить полный номер заказа, я сам выделю нужные цифры.\n\n"
-        "💡 <b>Доступные команды:</b>\n"
-        "/start - Начать регистрацию\n"
+        "Выбери интересующий раздел:"
     )
     
-    if is_admin_user:
-        text += "/sync_orders - Синхронизировать заказы вручную (экстренный случай, только для админов)\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="ℹ️ Общая информация", callback_data="help_general_info"),
+        ],
+        [
+            InlineKeyboardButton(text="📝 Как найти Ozon ID", callback_data="help_find_ozon_id"),
+        ],
+        [
+            InlineKeyboardButton(text="💰 Бонусные ставки", callback_data="help_bonus_rates"),
+        ],
+    ])
     
-    text += "/test_db - Проверить подключение к БД\n\n"
-    text += "Или используй кнопки ниже для быстрого доступа к функциям."
+    if isinstance(message_or_callback, types.Message):
+        await message_or_callback.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await message_or_callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        await message_or_callback.answer()
+
+@dp.message(lambda message: message.text == "🚪 Выйти из программы")
+async def leave_program_handler(message: types.Message, state: FSMContext):
+    """Обработчик кнопки 'Выйти из программы'."""
+    user = message.from_user
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
     
-    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+    if not participant:
+        await message.answer(
+            "❌ Ты еще не зарегистрирован в программе.\n\n"
+            "Сначала зарегистрируйся через команду /start.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Получаем количество рефералов
+    ozon_id = participant.get("Ozon ID")
+    referrals_by_level = await asyncio.to_thread(get_referrals_by_level, ozon_id, max_level=3)
+    
+    # Подсчитываем общее количество рефералов
+    # referrals_by_level имеет структуру: {1: [ozon_id, ...], 2: [ozon_id, ...], ...}
+    total_referrals = 0
+    for level_data in referrals_by_level.values():
+        # level_data - это список ozon_id, а не словарь
+        if isinstance(level_data, list):
+            total_referrals += len(level_data)
+        elif isinstance(level_data, dict):
+            # На случай, если структура изменится в будущем
+            total_referrals += len(level_data.get("referrals", []))
+    
+    # Формируем сообщение с предупреждением
+    referrals_text = ""
+    if total_referrals > 0:
+        referrals_text = f"\n\n⚠️ <b>Внимание!</b> У тебя есть <b>{total_referrals}</b> реферал"
+        if total_referrals == 1:
+            referrals_text += ". "
+        elif total_referrals < 5:
+            referrals_text += "а. "
+        else:
+            referrals_text += "ов. "
+        referrals_text += "При выходе из программы ты потеряешь всех своих рефералов, и они потеряют связь с тобой."
+    else:
+        referrals_text = "\n\n⚠️ <b>Внимание!</b> Это действие необратимо."
+    
+    text = (
+        f"🚪 <b>Выход из программы</b>\n\n"
+        f"Ты действительно хочешь выйти из бонусной программы?{referrals_text}\n\n"
+        f"После выхода:\n"
+        f"• Твой аккаунт будет удален из программы\n"
+        f"• Ты потеряешь всех своих рефералов\n"
+        f"• Ты сможешь заново зарегистрироваться через /start"
+    )
+    
+    # Создаем InlineKeyboard для подтверждения/отмены
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, выйти", callback_data="leave_program_confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="leave_program_cancel"),
+        ]
+    ])
+    
+    await state.set_state(LeavingProgram.confirming_leave)
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 @dp.message(lambda message: message.text == "👥 Управление")
 async def management_handler(message: types.Message):
@@ -594,6 +671,105 @@ async def bonus_settings_close_handler(callback: types.CallbackQuery):
     """Закрыть настройки бонусов."""
     await callback.answer()
     await callback.message.delete()
+
+# =========================================================
+# ОБРАБОТЧИКИ РАЗДЕЛА "ПОМОЩЬ"
+# =========================================================
+
+@dp.callback_query(lambda c: c.data == "help_main")
+async def help_main_handler(callback: types.CallbackQuery):
+    """Вернуться в главное меню помощи."""
+    await show_help_main_menu(callback)
+
+@dp.callback_query(lambda c: c.data == "help_general_info")
+async def help_general_info_handler(callback: types.CallbackQuery):
+    """Обработчик подраздела 'Общая информация'."""
+    await callback.answer()
+    
+    text = (
+        "ℹ️ <b>Общая информация</b>\n\n"
+        "🎉 Добро пожаловать в реферальную программу <b>Wistery</b>!\n\n"
+        "💰 <b>Как это работает:</b>\n"
+        "• Покупай товары Wistery на Ozon и получай скидки\n"
+        "• Приглашай друзей по своей реферальной ссылке\n"
+        "• Получай бонусы с покупок твоих друзей и их друзей\n"
+        "• Чем больше друзей пригласишь, тем больше бонусов!\n\n"
+        "🎯 <b>Преимущества:</b>\n"
+        "• Автоматическое начисление бонусов\n"
+        "• Многоуровневая система вознаграждений\n"
+        "• Простая регистрация - нужен только Ozon ID\n"
+        "• Отслеживание статистики в реальном времени\n\n"
+        "💡 <b>Начни прямо сейчас:</b>\n"
+        "Зарегистрируйся через /start и получи свою реферальную ссылку!"
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+        ]
+    ])
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data == "help_find_ozon_id")
+async def help_find_ozon_id_handler(callback: types.CallbackQuery):
+    """Обработчик подраздела 'Как найти Ozon ID'."""
+    await callback.answer()
+    
+    text = (
+        "📝 <b>Как найти свой Ozon ID?</b>\n\n"
+        "Твой Ozon ID — это первые цифры номера любого твоего заказа до тире.\n\n"
+        "<b>Пример:</b>\n"
+        "• Номер заказа: 10054917-1093-1\n"
+        "• Твой Ozon ID: <b>10054917</b>\n\n"
+        "💡 <b>Совет:</b> Можешь отправить полный номер заказа, я сам выделю нужные цифры.\n\n"
+        "📋 <b>Где найти номер заказа:</b>\n"
+        "• В личном кабинете Ozon\n"
+        "• В письме на email о заказе\n"
+        "• В мобильном приложении Ozon\n"
+        "• В SMS о статусе заказа"
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+        ]
+    ])
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data == "help_bonus_rates")
+async def help_bonus_rates_handler(callback: types.CallbackQuery):
+    """Обработчик подраздела 'Бонусные ставки'."""
+    await callback.answer()
+    
+    # Получаем текущие настройки бонусов
+    settings = await asyncio.to_thread(get_bonus_settings)
+    
+    text = "💰 <b>Бонусные ставки</b>\n\n"
+    text += "Текущие бонусные проценты:\n\n"
+    
+    # Показываем проценты для каждого уровня
+    for level in range(1, settings.max_levels + 1):
+        percent = getattr(settings, f'level_{level}_percent', 0.0)
+        if percent is None:
+            percent = 0.0
+        text += f"Уровень {level}: <b>{percent}%</b>\n"
+    
+    text += "\n💡 <b>Как это работает:</b>\n"
+    text += "• Уровень 1 - бонус с покупок твоих прямых рефералов\n"
+    if settings.max_levels > 1:
+        text += "• Уровень 2 - бонус с покупок рефералов твоих рефералов\n"
+    if settings.max_levels > 2:
+        text += "• И так далее до уровня " + str(settings.max_levels) + "\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+        ]
+    ])
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data == "bonus_edit_levels")
 async def bonus_edit_levels_handler(callback: types.CallbackQuery, state: FSMContext):
@@ -723,6 +899,64 @@ async def process_editing_percent(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введи число (можно с точкой, например: 5.5). Попробуй еще раз:")
 
+@dp.callback_query(lambda c: c.data == "leave_program_confirm")
+async def leave_program_confirm_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения выхода из программы."""
+    await callback.answer()
+    
+    user = callback.from_user
+    result = await asyncio.to_thread(delete_participant, user.id)
+    
+    if result.get("success"):
+        referrals_count = result.get("referrals_count", 0)
+        ozon_id = result.get("ozon_id", "")
+        
+        # Формируем сообщение о выходе
+        referrals_text = ""
+        if referrals_count > 0:
+            referrals_text = f"\n\n⚠️ У <b>{referrals_count}</b> твоих реферал"
+            if referrals_count == 1:
+                referrals_text += "а была удалена связь с тобой."
+            elif referrals_count < 5:
+                referrals_text += "ов была удалена связь с тобой."
+            else:
+                referrals_text += "ов была удалена связь с тобой."
+        
+        text = (
+            f"✅ <b>Ты успешно вышел из программы</b>\n\n"
+            f"Твой аккаунт (Ozon ID: {ozon_id}) был удален из программы.{referrals_text}\n\n"
+            f"💡 Если захочешь вернуться, можешь заново зарегистрироваться через команду /start."
+        )
+        
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.clear()
+    else:
+        text = (
+            "❌ <b>Ошибка</b>\n\n"
+            "Не удалось выйти из программы. Попробуй еще раз или обратись в поддержку."
+        )
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.clear()
+
+@dp.callback_query(lambda c: c.data == "leave_program_cancel")
+async def leave_program_cancel_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик отмены выхода из программы."""
+    await callback.answer("Выход отменен")
+    
+    text = (
+        "✅ <b>Выход отменен</b>\n\n"
+        "Ты остаешься в программе. Если нужна помощь, используй кнопки ниже."
+    )
+    
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.clear()
+    
+    # Отправляем клавиатуру отдельным сообщением
+    await callback.message.answer(
+        "Выбери команду:",
+        reply_markup=get_keyboard(callback.from_user.id)
+    )
+
 # =========================================================
 # 4. ОБРАБОТЧИК СОСТОЯНИЯ (Получение Ozon ID)
 # =========================================================
@@ -731,7 +965,7 @@ async def process_ozon_id(message: types.Message, state: FSMContext):
     # Проверяем, не нажата ли кнопка вместо ввода ID
     button_texts = ["📊 Моя статистика", "📦 Мои заказы", 
                      "❓ Помощь", "👥 Управление", "📈 Аналитика", "⚙️ Настройки", 
-                     "👥 Пригласить друга"]
+                     "👥 Пригласить друга", "🚪 Выйти из программы"]
     if message.text in button_texts:
         # Если нажата кнопка, обрабатываем её соответствующим обработчиком
         return
@@ -771,6 +1005,22 @@ async def process_ozon_id(message: types.Message, state: FSMContext):
     # достаём сохранённый referrer_id
     data = await state.get_data()
     referrer_id = data.get("referrer_id")
+    referrer_telegram_id = data.get("referrer_telegram_id")
+    
+    # Если Ozon ID реферера не был найден при /start, но есть Telegram ID,
+    # пытаемся найти реферера еще раз (возможно, он зарегистрировался между /start и вводом Ozon ID)
+    if not referrer_id and referrer_telegram_id:
+        print(f"🔄 Повторная попытка найти реферера по Telegram ID={referrer_telegram_id}")
+        referrer_participant = await asyncio.to_thread(
+            find_participant_by_telegram_id, referrer_telegram_id
+        )
+        if referrer_participant:
+            referrer_id = referrer_participant.get("Ozon ID")
+            print(f"✅ Реферер найден при регистрации: Telegram ID={referrer_telegram_id}, Ozon ID={referrer_id}")
+        else:
+            print(f"⚠️ Реферер все еще не найден: Telegram ID={referrer_telegram_id}")
+    
+    print(f"🔍 Создание участника {ozon_id} с referrer_id={referrer_id}")
 
     # создаём участника
     await asyncio.to_thread( 
@@ -782,6 +1032,28 @@ async def process_ozon_id(message: types.Message, state: FSMContext):
         referrer_id=referrer_id,
         language=message.from_user.language_code
     )
+
+    # Отправляем уведомление рефереру, если он есть
+    if referrer_id:
+        try:
+            referrer_participant = await asyncio.to_thread(find_participant_by_ozon_id, referrer_id)
+            if referrer_participant:
+                referrer_telegram_id_str = referrer_participant.get("Telegram ID")
+                if referrer_telegram_id_str:
+                    try:
+                        referrer_telegram_id = int(referrer_telegram_id_str)
+                        await notify_referrer_about_new_registration(
+                            referrer_telegram_id=referrer_telegram_id,
+                            new_participant_name=user.first_name or "друг",
+                            new_participant_ozon_id=ozon_id,
+                            new_participant_username=user.username
+                        )
+                    except (ValueError, Exception) as e:
+                        # Не критично, просто логируем
+                        print(f"⚠️ Не удалось отправить уведомление рефереру: {e}")
+        except Exception as e:
+            # Не критично, просто логируем
+            print(f"⚠️ Ошибка при поиске реферера для уведомления: {e}")
 
     await state.clear()
 
@@ -955,6 +1227,44 @@ async def notify_admins_about_sync_error(error_msg: str):
                 print(f"⚠️ Не удалось отправить уведомление об ошибке админу {admin_id}: {e}")
     except Exception as e:
         print(f"⚠️ Ошибка при отправке уведомлений об ошибке админам: {e}")
+
+async def notify_referrer_about_new_registration(
+    referrer_telegram_id: int,
+    new_participant_name: str,
+    new_participant_ozon_id: str,
+    new_participant_username: str | None = None
+) -> bool:
+    """
+    Отправляет уведомление рефереру о регистрации нового участника.
+    
+    Args:
+        referrer_telegram_id: Telegram ID реферера
+        new_participant_name: Имя нового участника
+        new_participant_ozon_id: Ozon ID нового участника
+        new_participant_username: Username нового участника (опционально)
+    
+    Returns:
+        True если уведомление отправлено успешно, False в случае ошибки
+    """
+    global bot
+    try:
+        # Формируем имя для отображения
+        display_name = new_participant_name
+        if new_participant_username:
+            display_name = f"{new_participant_name} (@{new_participant_username})"
+        
+        text = (
+            f"✨ <b>Случилось чудо!</b>\n\n"
+            f"Твой друг <b>{display_name}</b> присоединился к программе по твоей реферальной ссылке!\n\n"
+            f"🎯 Теперь ты будешь получать бонусы с каждой его покупки и покупок его друзей!\n"
+            f"Приглашай больше друзей и увеличивай свой доход! 💰"
+        )
+        
+        await bot.send_message(referrer_telegram_id, text, parse_mode="HTML")
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить уведомление рефереру {referrer_telegram_id}: {e}")
+        return False
 
 def should_sync_on_startup() -> bool:
     """

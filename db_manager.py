@@ -328,6 +328,67 @@ def create_participant(
         raise e
     finally:
         db.close()
+
+def delete_participant(telegram_id: int) -> dict:
+    """
+    Удаляет участника из программы.
+    Обнуляет referrer_id у всех его рефералов.
+    
+    Args:
+        telegram_id: Telegram ID участника для удаления
+        
+    Returns:
+        dict: {
+            "success": bool,
+            "referrals_count": int,  # Количество рефералов, у которых обнулен referrer_id
+            "ozon_id": str | None  # Ozon ID удаленного участника
+        }
+    """
+    db = SessionLocal()
+    try:
+        # Находим участника по Telegram ID
+        participant = db.query(Participant).filter(
+            Participant.telegram_id == str(telegram_id)
+        ).first()
+        
+        if not participant:
+            return {
+                "success": False,
+                "referrals_count": 0,
+                "ozon_id": None
+            }
+        
+        ozon_id = participant.ozon_id
+        
+        # Находим всех рефералов участника (где referrer_id == ozon_id участника)
+        referrals = db.query(Participant).filter(
+            Participant.referrer_id == str(ozon_id)
+        ).all()
+        
+        referrals_count = len(referrals)
+        
+        # Обнуляем referrer_id у всех рефералов
+        for referral in referrals:
+            referral.referrer_id = None
+        
+        # Удаляем участника
+        db.delete(participant)
+        
+        # Сохраняем изменения
+        db.commit()
+        
+        return {
+            "success": True,
+            "referrals_count": referrals_count,
+            "ozon_id": ozon_id
+        }
+    except Exception as e:
+        db.rollback()
+        print(f"Ошибка при удалении участника: {e}")
+        raise e
+    finally:
+        db.close()
+
 def get_user_orders_stats(ozon_id: str) -> dict:
     """Получает статистику по заказам пользователя.
     
