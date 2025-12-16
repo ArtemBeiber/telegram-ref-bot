@@ -1,0 +1,20 @@
+# Конфигурация GitHub Remote
+# Замените YOUR_USERNAME на ваш GitHub username и выполните команды ниже
+
+# Удалить старый remote (если есть)
+# git remote remove origin
+
+# Добавить новый remote (выберите один вариант)
+
+# Вариант 1: HTTPS (рекомендуется для начала)
+# git remote add origin https://github.com/YOUR_USERNAME/telegram-ref-bot.git
+
+# Вариант 2: SSH (если настроены SSH ключи)
+# git remote add origin git@github.com:YOUR_USERNAME/telegram-ref-bot.git
+
+# Проверить remote
+# git remote -v
+
+# Отправить изменения
+# git push -u origin main
+
