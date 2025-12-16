@@ -19,8 +19,8 @@ python setup_github.py
 Замените `YOUR_USERNAME` на ваш GitHub username:
 
 ```bash
-# 1. Добавить remote
-git remote add origin https://github.com/YOUR_USERNAME/telegram-ref-bot.git
+# 1. Добавить remote (уже настроен)
+# git remote add origin https://github.com/ArtemBeiber/telegram-ref-bot.git
 
 # 2. Проверить
 git remote -v

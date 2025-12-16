@@ -4,8 +4,8 @@
 
 1. **Git remote настроен:**
    ```
-   origin  https://github.com/Artem/telegram-ref-bot.git (fetch)
-   origin  https://github.com/Artem/telegram-ref-bot.git (push)
+   origin  https://github.com/ArtemBeiber/telegram-ref-bot.git (fetch)
+   origin  https://github.com/ArtemBeiber/telegram-ref-bot.git (push)
    ```
 
 2. **Все изменения закоммичены:**
@@ -15,7 +15,7 @@
 
 ## ⚠️ Требуется действие
 
-Репозиторий `https://github.com/Artem/telegram-ref-bot` не найден на GitHub.
+Репозиторий `https://github.com/ArtemBeiber/telegram-ref-bot` не найден на GitHub.
 
 ### Вариант 1: Username правильный, но репозиторий не создан
 
