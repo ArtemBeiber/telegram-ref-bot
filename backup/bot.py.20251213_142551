@@ -1,0 +1,639 @@
+import asyncio
+import logging
+import os
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from dotenv import load_dotenv
+
+from db_manager import (
+    find_participant_by_telegram_id,
+    find_participant_by_ozon_id,
+    create_participant,
+    create_database,
+)
+
+from states import Registration
+# ИМПОРТ ДЛЯ СИНХРОНИЗАЦИИ ЗАКАЗОВ
+from orders_updater import update_orders_sheet, fill_customers_from_existing_orders 
+
+
+# грузим переменные из .env
+load_dotenv()
+API_TOKEN = os.getenv("BOT_TOKEN")
+
+if not API_TOKEN:
+    raise RuntimeError("Нет BOT_TOKEN в .env, проверь файл .env")
+
+# Список ID администраторов (можно загружать из .env)
+# Формат в .env: ADMIN_IDS=123456789,987654321
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+if admin_ids_str:
+    ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
+else:
+    # Если не указано в .env, можно задать здесь
+    ADMIN_IDS = [419985638]  # Artem (ID: 419985638)
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# =========================================================
+# СИСТЕМА ПРОВЕРКИ ПРАВ АДМИНИСТРАТОРА
+# =========================================================
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором."""
+    return user_id in ADMIN_IDS
+
+
+# =========================================================
+# СОЗДАНИЕ КЛАВИАТУР С КНОПКАМИ
+# =========================================================
+def get_user_keyboard() -> ReplyKeyboardMarkup:
+    """Создает клавиатуру для обычных пользователей."""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="📊 Моя статистика"),
+                KeyboardButton(text="📦 Мои заказы"),
+            ],
+            [
+                KeyboardButton(text="❓ Помощь"),
+            ],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите команду или введите Ozon ID"
+    )
+    return keyboard
+
+
+def get_admin_keyboard() -> ReplyKeyboardMarkup:
+    """Создает клавиатуру для администраторов."""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🔄 Синхронизировать заказы"),
+                KeyboardButton(text="📊 Моя статистика"),
+            ],
+            [
+                KeyboardButton(text="📦 Мои заказы"),
+                KeyboardButton(text="👥 Управление"),
+            ],
+            [
+                KeyboardButton(text="📈 Аналитика"),
+                KeyboardButton(text="⚙️ Настройки"),
+            ],
+            [
+                KeyboardButton(text="🔄 Заполнить старые клиенты"),
+                KeyboardButton(text="❓ Помощь"),
+            ],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите команду или введите Ozon ID"
+    )
+    return keyboard
+
+
+def get_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    """Возвращает клавиатуру в зависимости от роли пользователя."""
+    if is_admin(user_id):
+        return get_admin_keyboard()
+    else:
+        return get_user_keyboard()
+
+
+# =========================================================
+# 1. ОБРАБОТЧИК КОМАНДЫ /START (Начало регистрации)
+# =========================================================
+@dp.message(CommandStart())
+async def start_handler(message: types.Message, state: FSMContext):
+    user = message.from_user
+    tg_id = user.id
+    username = user.username
+    first_name = user.first_name
+
+    # парсим реферальный код, если он есть в /start <код>
+    parts = message.text.split(maxsplit=1)
+    referrer_id = None
+    if len(parts) == 2:
+        referrer_id = parts[1].strip()
+
+    # пробуем найти участника по Telegram ID
+    # ИСПРАВЛЕНО: Оборачиваем синхронную функцию Sheets в asyncio.to_thread
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, tg_id) 
+
+    if participant:
+        # уже есть в системе
+        text = (
+            f"Привет, {first_name or username or 'друг'}! 👋\n\n"
+            "Ты уже зарегистрирован в реферальной программе.\n"
+            "Используй кнопки ниже для навигации."
+        )
+        await state.clear()
+        await message.answer(text, reply_markup=get_keyboard(tg_id))
+        return
+
+    # нового участника ещё нет — начинаем регистрацию
+    await state.update_data(referrer_id=referrer_id)
+
+    text = (
+        f"Привет, {first_name or username or 'друг'}! 👋\n\n"
+        "Чтобы зарегистрировать тебя в реферальной программе,\n"
+        "мне нужен твой <b>Ozon ID (ID покупателя)</b>.\n\n"
+        "Пожалуйста, отправь его одним сообщением.\n"
+        "Если не знаешь, где его посмотреть — нажми кнопку '❓ Помощь'."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(tg_id))
+    await state.set_state(Registration.waiting_for_ozon_id)
+
+
+# =========================================================
+# 2. ОБРАБОТЧИК КОМАНДЫ /TEST_DB (Проверка подключения к БД)
+# =========================================================
+@dp.message(Command("test_db"))
+async def test_db(message: types.Message):
+    try:
+        # Проверяем подключение к базе данных
+        await asyncio.to_thread(create_database)
+        
+        # Пробуем найти участника (тестовый запрос)
+        test_result = await asyncio.to_thread(find_participant_by_telegram_id, 0)
+        
+        await message.answer(
+            f"Подключение к базе данных работает! 🎉\n"
+            f"База данных готова к использованию.",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+    except Exception as e:
+        await message.answer(
+            f"Ошибка при подключении к базе данных ❌\n<code>{e}</code>",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+
+# =========================================================
+# 3. ОБРАБОТЧИК КОМАНДЫ /SYNC_ORDERS
+# =========================================================
+@dp.message(Command("sync_orders"))
+async def sync_orders_handler(message: types.Message):
+    """Обновляет лист 'Заказы', вызывая функцию обновления."""
+    # #region agent log
+    import json
+    from datetime import datetime
+    try:
+        with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"N","location":"bot.py:185","message":"sync_orders_handler entry","data":{"user_id":message.from_user.id},"timestamp":int(datetime.now().timestamp()*1000)}
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+    except Exception as log_err:
+        print(f"Ошибка логирования: {log_err}")
+    # #endregion
+    
+    # Проверка прав администратора
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "❌ У тебя нет прав для выполнения этой команды.",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+        return
+    
+    try:
+        # #region agent log
+        try:
+            with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"O","location":"bot.py:196","message":"Calling update_orders_sheet","data":{},"timestamp":int(datetime.now().timestamp()*1000)}
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception as log_err:
+            print(f"Ошибка логирования: {log_err}")
+        # #endregion
+        result = await asyncio.to_thread(update_orders_sheet)
+        # #region agent log
+        import json
+        from datetime import datetime
+        try:
+            with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"H","location":"bot.py:210","message":"Sync result received","data":{"result_type":type(result).__name__,"result_keys":list(result.keys()) if isinstance(result, dict) else "not_dict","has_participants_count":"participants_with_orders_count" in result if isinstance(result, dict) else False,"has_period_start":"period_start" in result if isinstance(result, dict) else False,"has_period_end":"period_end" in result if isinstance(result, dict) else False},"timestamp":int(datetime.now().timestamp()*1000)}
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception as log_err:
+            print(f"Ошибка логирования: {log_err}")
+        # #endregion
+        
+        # Проверка структуры результата
+        if not isinstance(result, dict):
+            # #region agent log
+            try:
+                with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                    log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"Q","location":"bot.py:220","message":"Result is not dict","data":{"result_type":type(result).__name__,"result_value":str(result)[:200]},"timestamp":int(datetime.now().timestamp()*1000)}
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception as log_err:
+                print(f"Ошибка логирования: {log_err}")
+            # #endregion
+            await message.answer(
+                "❌ Ошибка: неверный формат результата синхронизации.",
+                reply_markup=get_keyboard(message.from_user.id)
+            )
+            return
+        
+        # Форматируем период для отображения
+        # #region agent log
+        try:
+            with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"R","location":"bot.py:232","message":"Extracting period from result","data":{"has_period_start":"period_start" in result,"has_period_end":"period_end" in result,"period_start_type":type(result.get("period_start")).__name__ if "period_start" in result else "missing","period_end_type":type(result.get("period_end")).__name__ if "period_end" in result else "missing"},"timestamp":int(datetime.now().timestamp()*1000)}
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception as log_err:
+            print(f"Ошибка логирования: {log_err}")
+        # #endregion
+        
+        period_start = result.get("period_start")
+        period_end = result.get("period_end")
+        
+        if period_start is None or period_end is None:
+            # #region agent log
+            try:
+                with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                    log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"S","location":"bot.py:240","message":"Period missing in result","data":{"period_start":period_start is not None,"period_end":period_end is not None},"timestamp":int(datetime.now().timestamp()*1000)}
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception as log_err:
+                print(f"Ошибка логирования: {log_err}")
+            # #endregion
+            await message.answer(
+                "❌ Ошибка: отсутствует информация о периоде синхронизации.",
+                reply_markup=get_keyboard(message.from_user.id)
+            )
+            return
+        
+        # Форматируем даты в читаемый вид (DD.MM.YYYY HH:MM)
+        period_start_str = period_start.strftime("%d.%m.%Y %H:%M")
+        period_end_str = period_end.strftime("%d.%m.%Y %H:%M")
+        
+        # Получаем статистику по статусам за первый день периода
+        first_day_stats = result.get("first_day_stats", {})
+        
+        # Формируем строку со статистикой по статусам
+        status_stats_text = ""
+        if first_day_stats and first_day_stats.get("total", 0) > 0:
+            first_day_date = period_start_str.split()[0]  # Берем только дату без времени
+            status_stats_text = f"\n\n📊 <b>Статистика за {first_day_date}:</b>\n"
+            status_stats_text += f"Всего заказов: <b>{first_day_stats['total']}</b>\n"
+            
+            statuses = first_day_stats.get("statuses", {})
+            if statuses:
+                # Сортируем по количеству (от большего к меньшему)
+                sorted_statuses = sorted(statuses.items(), key=lambda x: x[1], reverse=True)
+                for status, count in sorted_statuses:
+                    percentage = (count / first_day_stats['total']) * 100
+                    status_name = {
+                        "delivered": "✅ Доставлено",
+                        "delivering": "🚚 В доставке",
+                        "awaiting_packaging": "📦 Ожидает упаковки",
+                        "awaiting_deliver": "⏳ Ожидает доставки",
+                        "cancelled": "❌ Отменено"
+                    }.get(status, status)
+                    status_stats_text += f"{status_name}: <b>{count}</b> ({percentage:.1f}%)\n"
+            
+            if first_day_stats.get("active_count", 0) > 0:
+                status_stats_text += f"\n⚠️ Активных заказов: <b>{first_day_stats['active_count']}</b>"
+        
+        if result["count"] > 0:
+            text = (
+                f"🎉 Синхронизация завершена! 🎉\n\n"
+                f"✅ Добавлено <b>{result['count']}</b> новых заказов\n"
+                f"👥 Обработано <b>{result['customers_count']}</b> клиентов "
+                f"(новых: <b>{result['new_customers_count']}</b>)\n"
+                f"🎯 Участников программы совершивших покупку: <b>{result.get('participants_with_orders_count', 0)}</b>\n\n"
+                f"📅 <b>Период синхронизации:</b>\n"
+                f"С: {period_start_str}\n"
+                f"По: {period_end_str}"
+                f"{status_stats_text}"
+            )
+        else:
+            text = (
+                f"✅ Синхронизация завершена!\n\n"
+                f"Новых заказов не найдено.\n\n"
+                f"📅 <b>Период проверки:</b>\n"
+                f"С: {period_start_str}\n"
+                f"По: {period_end_str}"
+                f"{status_stats_text}"
+            )
+
+        await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(message.from_user.id))
+        
+    except Exception as e:
+        # #region agent log
+        import json
+        from datetime import datetime
+        with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"I","location":"bot.py:230","message":"Exception in sync handler","data":{"error":str(e),"error_type":type(e).__name__},"timestamp":int(datetime.now().timestamp()*1000)}
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        # #endregion
+        await message.answer(
+            f"❌ Ошибка при синхронизации заказов ❌\n"
+            f"<code>{e}</code>",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+
+
+# =========================================================
+# ОБРАБОТЧИКИ КНОПОК КЛАВИАТУРЫ
+# =========================================================
+@dp.message(lambda message: message.text == "🔄 Синхронизировать заказы")
+async def sync_orders_button_handler(message: types.Message):
+    """Обработчик кнопки 'Синхронизировать заказы'."""
+    # #region agent log
+    import json
+    from datetime import datetime
+    try:
+        with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"P","location":"bot.py:273","message":"sync_orders_button_handler entry","data":{"user_id":message.from_user.id},"timestamp":int(datetime.now().timestamp()*1000)}
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+    except Exception as log_err:
+        print(f"Ошибка логирования: {log_err}")
+    # #endregion
+    
+    # Проверка прав администратора
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "❌ У тебя нет прав для выполнения этой команды.",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+        return
+    await sync_orders_handler(message)
+
+
+@dp.message(lambda message: message.text == "📊 Моя статистика")
+async def my_stats_handler(message: types.Message):
+    """Обработчик кнопки 'Моя статистика'."""
+    user = message.from_user
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
+    
+    if not participant:
+        await message.answer(
+            "❌ Ты еще не зарегистрирован в программе.\n"
+            "Используй команду /start для регистрации.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Здесь можно добавить логику получения статистики из БД
+    text = (
+        f"📊 <b>Твоя статистика</b>\n\n"
+        f"Ozon ID: <code>{participant.get('Ozon ID', 'Не указан')}</code>\n"
+        f"Дата регистрации: {participant.get('Дата регистрации', 'Не указана')}\n\n"
+        f"Статистика по заказам будет доступна после синхронизации."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+
+
+@dp.message(lambda message: message.text == "📦 Мои заказы")
+async def my_orders_handler(message: types.Message):
+    """Обработчик кнопки 'Мои заказы'."""
+    user = message.from_user
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
+    
+    if not participant:
+        await message.answer(
+            "❌ Ты еще не зарегистрирован в программе.\n"
+            "Используй команду /start для регистрации.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Здесь можно добавить логику получения заказов из БД
+    ozon_id = participant.get('Ozon ID')
+    text = (
+        f"📦 <b>Твои заказы</b>\n\n"
+        f"Ozon ID: <code>{ozon_id}</code>\n\n"
+        f"Функция просмотра заказов будет доступна в ближайшее время."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+
+
+@dp.message(lambda message: message.text == "❓ Помощь")
+async def help_handler(message: types.Message):
+    """Обработчик кнопки 'Помощь'."""
+    user_id = message.from_user.id
+    is_admin_user = is_admin(user_id)
+    
+    text = (
+        "❓ <b>Помощь</b>\n\n"
+        "📝 <b>Как найти свой Ozon ID?</b>\n"
+        "1. Открой приложение Ozon\n"
+        "2. Перейди в раздел 'Профиль'\n"
+        "3. Нажми на свой номер телефона\n"
+        "4. Твой ID покупателя будет указан внизу страницы\n\n"
+        "💡 <b>Доступные команды:</b>\n"
+        "/start - Начать регистрацию\n"
+    )
+    
+    if is_admin_user:
+        text += "/sync_orders - Синхронизировать заказы (только для админов)\n"
+    
+    text += "/test_db - Проверить подключение к БД\n\n"
+    text += "Или используй кнопки ниже для быстрого доступа к функциям."
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+
+
+@dp.message(lambda message: message.text == "👥 Управление")
+async def management_handler(message: types.Message):
+    """Обработчик кнопки 'Управление' (только для админов)."""
+    user_id = message.from_user.id
+    
+    if not is_admin(user_id):
+        await message.answer(
+            "❌ У тебя нет прав для выполнения этой команды.",
+            reply_markup=get_keyboard(user_id)
+        )
+        return
+    
+    text = (
+        "👥 <b>Управление пользователями</b>\n\n"
+        "Функция управления пользователями будет доступна в ближайшее время.\n\n"
+        "Здесь можно будет:\n"
+        "• Просматривать список всех участников\n"
+        "• Управлять правами доступа\n"
+        "• Редактировать данные участников"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+
+
+@dp.message(lambda message: message.text == "📈 Аналитика")
+async def analytics_handler(message: types.Message):
+    """Обработчик кнопки 'Аналитика' (только для админов)."""
+    user_id = message.from_user.id
+    
+    if not is_admin(user_id):
+        await message.answer(
+            "❌ У тебя нет прав для выполнения этой команды.",
+            reply_markup=get_keyboard(user_id)
+        )
+        return
+    
+    text = (
+        "📈 <b>Аналитика</b>\n\n"
+        "Функция аналитики будет доступна в ближайшее время.\n\n"
+        "Здесь можно будет:\n"
+        "• Просматривать общую статистику по заказам\n"
+        "• Анализировать продажи\n"
+        "• Получать отчеты по периодам"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+
+
+@dp.message(lambda message: message.text == "⚙️ Настройки")
+async def settings_handler(message: types.Message):
+    """Обработчик кнопки 'Настройки' (только для админов)."""
+    user_id = message.from_user.id
+    
+    if not is_admin(user_id):
+        await message.answer(
+            "❌ У тебя нет прав для выполнения этой команды.",
+            reply_markup=get_keyboard(user_id)
+        )
+        return
+    
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        "Функция настроек будет доступна в ближайшее время.\n\n"
+        "Здесь можно будет:\n"
+        "• Настраивать параметры синхронизации\n"
+        "• Управлять настройками бота\n"
+        "• Конфигурировать систему уведомлений"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+
+
+@dp.message(lambda message: message.text == "🔄 Заполнить старые клиенты")
+async def fill_old_customers_handler(message: types.Message):
+    """Обработчик для заполнения таблицы customers из существующих заказов."""
+    user_id = message.from_user.id
+    
+    if not is_admin(user_id):
+        await message.answer(
+            "❌ У тебя нет прав для выполнения этой команды",
+            reply_markup=get_keyboard(user_id)
+        )
+        return
+    
+    await message.answer("⏳ Начинаю обработку старых заказов...", reply_markup=get_keyboard(user_id))
+    
+    try:
+        result = await asyncio.to_thread(fill_customers_from_existing_orders)
+        
+        text = (
+            f"✅ Обработка завершена!\n\n"
+            f"📦 Обработано заказов: <b>{result['processed_orders']}</b>\n"
+            f"👥 Создано клиентов: <b>{result['customers_created']}</b>\n"
+            f"🔄 Обновлено клиентов: <b>{result['customers_updated']}</b>\n"
+            f"📊 Всего уникальных клиентов: <b>{result['total_customers']}</b>"
+        )
+        
+        await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+    except Exception as e:
+        await message.answer(
+            f"❌ Ошибка при обработке: {str(e)}",
+            reply_markup=get_keyboard(user_id)
+        )
+
+
+# =========================================================
+# 4. ОБРАБОТЧИК СОСТОЯНИЯ (Получение Ozon ID)
+# =========================================================
+@dp.message(Registration.waiting_for_ozon_id)
+async def process_ozon_id(message: types.Message, state: FSMContext):
+    # Проверяем, не нажата ли кнопка вместо ввода ID
+    button_texts = ["🔄 Синхронизировать заказы", "📊 Моя статистика", "📦 Мои заказы", 
+                     "❓ Помощь", "👥 Управление", "📈 Аналитика", "⚙️ Настройки"]
+    if message.text in button_texts:
+        # Если нажата кнопка, обрабатываем её соответствующим обработчиком
+        return
+    
+    ozon_id = message.text.strip()
+    user = message.from_user
+
+    # проверяем, что ID выглядит нормально
+    if not ozon_id.isdigit():
+        await message.answer(
+            "Ozon ID должен содержать только цифры. Попробуй ещё раз.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+
+    # проверяем, нет ли такого участника уже
+    exist = await asyncio.to_thread(find_participant_by_ozon_id, ozon_id) 
+    if exist:
+        await message.answer(
+            "Такой Ozon ID уже есть в системе. Если ты считаешь, что это ошибка, напиши в поддержку.",
+            reply_markup=get_keyboard(user.id)
+        )
+        await state.clear() 
+        return
+
+    # достаём сохранённый referrer_id
+    data = await state.get_data()
+    referrer_id = data.get("referrer_id")
+
+    # создаём участника
+    await asyncio.to_thread( 
+        create_participant,
+        ozon_id=ozon_id,
+        tg_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        referrer_id=referrer_id,
+        language=message.from_user.language_code
+    )
+
+    await state.clear()
+
+    await message.answer(
+        f"Готово, {user.first_name or 'друг'}! Ты успешно зарегистрирован в программе.\n"
+        f"Твой Ozon ID: {ozon_id}\n\n"
+        f"Теперь я смогу отслеживать твои покупки и начислять баллы 😊",
+        reply_markup=get_keyboard(user.id)
+    )
+
+
+# =========================================================
+# 5. ЗАПУСК БОТА
+# =========================================================
+async def main():
+    # #region agent log
+    import json
+    from datetime import datetime
+    try:
+        with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"L","location":"bot.py:471","message":"Bot main() started","data":{},"timestamp":int(datetime.now().timestamp()*1000)}
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+    except Exception as log_err:
+        print(f"Ошибка логирования: {log_err}")
+    # #endregion
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        # #region agent log
+        import json
+        from datetime import datetime
+        try:
+            with open(r'c:\telegram-ref-bot\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                log_entry = {"sessionId":"debug-session","runId":"run1","hypothesisId":"M","location":"bot.py:472","message":"Exception in main()","data":{"error":str(e),"error_type":type(e).__name__},"timestamp":int(datetime.now().timestamp()*1000)}
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception as log_err:
+            print(f"Ошибка логирования: {log_err}")
+        # #endregion
+        print(f"Критическая ошибка в боте: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

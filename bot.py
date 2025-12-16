@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import socket
+from datetime import datetime
+from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
@@ -13,21 +16,30 @@ from dotenv import load_dotenv
 from db_manager import (
     find_participant_by_telegram_id,
     find_participant_by_ozon_id,
+    find_participant_by_username,
     create_participant,
-    delete_participant,
+    deactivate_participant,
     create_database,
     get_user_orders_stats,
+    get_user_orders_summary,
     get_referrals_by_level,
     get_referrals_orders_stats,
     get_user_bonuses,
     get_referrals_bonuses_stats,
     get_bonus_settings,
     update_bonus_settings,
+    get_available_bonuses_for_withdrawal,
     clear_bonus_settings_cache,
     get_last_sync_timestamp,
+    get_daily_bonus_summary,
+    get_all_participants,
+    SessionLocal,
+    Order,
+    BonusTransaction,
+    Participant,
 )
 
-from states import Registration, BonusSettings, LeavingProgram
+from states import Registration, BonusSettings, LeavingProgram, ParticipantAnalytics
 # ИМПОРТ ДЛЯ СИНХРОНИЗАЦИИ ЗАКАЗОВ
 from orders_updater import update_orders_sheet 
 
@@ -70,6 +82,21 @@ async def get_referral_link(bot: Bot, telegram_id: int) -> str:
     bot_username = me.username
     return f"https://t.me/{bot_username}?start={telegram_id}"
 
+async def get_admin_contact_info(admin_id: int) -> dict:
+    """Получает информацию об админе для отправки контакта."""
+    try:
+        chat = await bot.get_chat(admin_id)
+        return {
+            "user_id": admin_id,
+            "username": chat.username,
+            "first_name": chat.first_name,
+            "last_name": chat.last_name,
+            "has_username": chat.username is not None
+        }
+    except Exception as e:
+        print(f"Ошибка при получении информации об админе: {e}")
+        return None
+
 def get_user_keyboard() -> ReplyKeyboardMarkup:
     """Создает клавиатуру для обычных пользователей."""
     keyboard = ReplyKeyboardMarkup(
@@ -81,6 +108,9 @@ def get_user_keyboard() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text="👥 Пригласить друга"),
                 KeyboardButton(text="❓ Помощь"),
+            ],
+            [
+                KeyboardButton(text="💸 Вывести бонусы"),
             ],
             [
                 KeyboardButton(text="🚪 Выйти из программы"),
@@ -107,6 +137,9 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text="⚙️ Настройки"),
                 KeyboardButton(text="👥 Пригласить друга"),
+            ],
+            [
+                KeyboardButton(text="💸 Вывести бонусы"),
             ],
             [
                 KeyboardButton(text="❓ Помощь"),
@@ -368,6 +401,9 @@ async def my_stats_handler(message: types.Message):
         # Получаем бонусы пользователя
         user_bonuses = await asyncio.to_thread(get_user_bonuses, ozon_id)
         
+        # Получаем доступные к выводу бонусы
+        available_bonuses = await asyncio.to_thread(get_available_bonuses_for_withdrawal, ozon_id)
+        
         # Формируем текст
         text = (
             f"📊 Моя статистика\n\n"
@@ -377,7 +413,8 @@ async def my_stats_handler(message: types.Message):
             f"📦 Мои заказы:\n"
             f"• Всего доставлено заказов: {user_stats['delivered_count']}\n"
             f"• Общая сумма: {format_number(user_stats['total_sum'])} ₽\n"
-            f"• Начислено бонусов: {format_number(user_bonuses)} ₽\n\n"
+            f"• Начислено бонусов: {format_number(user_bonuses)} ₽\n"
+            f"• Доступно к выводу: {format_number(available_bonuses)} ₽\n\n"
             f"👥 Реферальная программа:\n\n"
         )
         
@@ -449,14 +486,105 @@ async def my_orders_handler(message: types.Message):
         )
         return
     
-    # Здесь можно добавить логику получения заказов из БД
     ozon_id = participant.get('Ozon ID')
-    text = (
-        f"📦 <b>Твои заказы</b>\n\n"
-        f"Ozon ID: <code>{ozon_id}</code>\n\n"
-        f"Функция просмотра заказов будет доступна в ближайшее время."
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+    if not ozon_id:
+        await message.answer(
+            "❌ Ошибка: Ozon ID не найден.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    try:
+        # Получаем сводку по заказам
+        summary = await asyncio.to_thread(get_user_orders_summary, ozon_id)
+        
+        # Функция для форматирования чисел с пробелами
+        def format_number(num):
+            try:
+                return f"{int(num):,}".replace(',', ' ')
+            except (ValueError, TypeError):
+                return "0"
+        
+        def format_float(num):
+            try:
+                return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+            except (ValueError, TypeError):
+                return "0,00"
+        
+        # Форматируем дату регистрации
+        reg_date = summary.get("registration_date")
+        if reg_date:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(reg_date, "%Y-%m-%d")
+                reg_date_str = dt.strftime("%d.%m.%Y")
+            except:
+                reg_date_str = reg_date
+        else:
+            reg_date_str = "не указана"
+        
+        total_orders = summary.get("total_orders", 0)
+        total_sum = summary.get("total_sum", 0.0)
+        by_status = summary.get("by_status", {})
+        
+        if total_orders == 0:
+            text = (
+                f"📦 <b>Твои заказы</b>\n\n"
+                f"Ozon ID: <code>{ozon_id}</code>\n"
+                f"Дата регистрации: {reg_date_str}\n\n"
+                f"У тебя пока нет заказов с даты регистрации в программе."
+            )
+        else:
+            text = (
+                f"📦 <b>Твои заказы</b>\n\n"
+                f"Ozon ID: <code>{ozon_id}</code>\n"
+                f"Дата регистрации: {reg_date_str}\n\n"
+                f"📊 <b>Общая статистика:</b>\n"
+                f"• Всего заказов: <b>{total_orders}</b>\n"
+                f"• Общая сумма: <b>{format_float(total_sum)}</b> ₽\n\n"
+            )
+            
+            # Словарь для перевода статусов на русский
+            status_names = {
+                "delivered": "✅ Доставлено",
+                "delivering": "🚚 В доставке",
+                "awaiting_packaging": "📦 Ожидает упаковки",
+                "awaiting_deliver": "⏳ Ожидает доставки",
+                "cancelled": "❌ Отменено",
+                "unknown": "❓ Неизвестный статус"
+            }
+            
+            # Показываем разбивку по статусам
+            if by_status:
+                text += f"📋 <b>По статусам:</b>\n"
+                
+                # Сортируем статусы по количеству заказов (от большего к меньшему)
+                sorted_statuses = sorted(
+                    by_status.items(),
+                    key=lambda x: x[1]["count"],
+                    reverse=True
+                )
+                
+                for status, data in sorted_statuses:
+                    status_name = status_names.get(status, f"❓ {status}")
+                    count = data.get("count", 0)
+                    sum_amount = data.get("sum", 0.0)
+                    text += f"• {status_name}: <b>{count}</b> заказ"
+                    
+                    # Правильное склонение слова "заказ"
+                    if count == 1:
+                        text += f" — {format_float(sum_amount)} ₽\n"
+                    elif count < 5:
+                        text += f"а — {format_float(sum_amount)} ₽\n"
+                    else:
+                        text += f"ов — {format_float(sum_amount)} ₽\n"
+        
+        await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+    except Exception as e:
+        await message.answer(
+            f"❌ Произошла ошибка при получении информации о заказах: {str(e)}",
+            reply_markup=get_keyboard(user.id)
+        )
 
 @dp.message(lambda message: message.text == "👥 Пригласить друга")
 async def invite_friend_handler(message: types.Message):
@@ -494,10 +622,113 @@ async def invite_friend_handler(message: types.Message):
     await message.answer(invite_text, reply_markup=get_keyboard(user.id))
     await message.answer(instruction_text, reply_markup=get_keyboard(user.id))
 
+@dp.message(lambda message: message.text == "💸 Вывести бонусы")
+async def withdrawal_bonuses_handler(message: types.Message):
+    """Обработчик кнопки 'Вывести бонусы'."""
+    user = message.from_user
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
+    
+    if not participant:
+        await message.answer(
+            "❌ Ты еще не зарегистрирован в программе.\n\n"
+            "Сначала зарегистрируйся через команду /start.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Заглушка - функция в разработке
+    text = (
+        "💸 <b>Вывод бонусов</b>\n\n"
+        "⏳ Эта функция находится в разработке.\n\n"
+        "Скоро ты сможешь выводить накопленные бонусы на карту или электронный кошелек.\n\n"
+        "Следи за обновлениями! 🚀"
+    )
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+
 @dp.message(lambda message: message.text == "❓ Помощь")
 async def help_handler(message: types.Message):
     """Обработчик кнопки 'Помощь' - показывает главное меню помощи."""
     await show_help_main_menu(message)
+
+@dp.message(lambda message: message.text == "💬 Чат с админом")
+async def chat_with_admin_handler(message: types.Message):
+    """Обработчик кнопки 'Чат с админом'."""
+    user = message.from_user
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
+    
+    if not participant:
+        await message.answer(
+            "❌ Ты еще не зарегистрирован в программе.\n\n"
+            "Сначала зарегистрируйся через команду /start.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Получаем информацию о первом админе
+    if not ADMIN_IDS:
+        await message.answer(
+            "❌ Администратор временно недоступен. Попробуй позже.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    admin_id = ADMIN_IDS[0]  # Берем первого админа
+    admin_info = await get_admin_contact_info(admin_id)
+    
+    if not admin_info:
+        await message.answer(
+            "❌ Не удалось получить контакт администратора. Попробуй позже.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Если у админа есть username
+    if admin_info["has_username"]:
+        username = admin_info["username"]
+        text = (
+            f"💬 <b>Чат с администратором</b>\n\n"
+            f"Нажми на кнопку ниже, чтобы написать администратору напрямую:\n\n"
+            f"Или напиши ему в Telegram: @{username}"
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="💬 Написать администратору",
+                url=f"https://t.me/{username}"
+            )]
+        ])
+        
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    
+    # Если username нет - отправляем инструкцию
+    else:
+        admin_name = admin_info["first_name"] or "Администратор"
+        if admin_info.get("last_name"):
+            admin_name += f" {admin_info['last_name']}"
+        
+        text = (
+            f"💬 <b>Чат с администратором</b>\n\n"
+            f"Администратор: <b>{admin_name}</b>\n\n"
+            f"Чтобы связаться с администратором:\n"
+            f"1. Открой Telegram\n"
+            f"2. Найди пользователя по имени: <b>{admin_name}</b>\n"
+            f"3. Напиши ему напрямую\n\n"
+            f"Или попроси администратора добавить username в настройках Telegram для более удобной связи."
+        )
+        await message.answer(text, parse_mode="HTML")
+    
+    # Инструкция
+    instruction_text = (
+        f"\n\n💡 <b>Как это работает:</b>\n"
+        f"• Нажми на кнопку выше или напиши администратору напрямую\n"
+        f"• Вся переписка будет в вашем личном чате в Telegram\n"
+        f"• Администратор ответит в ближайшее время"
+    )
+    await message.answer(instruction_text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+    
+    # Уведомляем админа о новом запросе
+    await notify_admin_about_chat_request(admin_id, user, participant)
 
 async def show_help_main_menu(message_or_callback):
     """Показывает главное меню помощи с подразделами."""
@@ -515,6 +746,9 @@ async def show_help_main_menu(message_or_callback):
         ],
         [
             InlineKeyboardButton(text="💰 Бонусные ставки", callback_data="help_bonus_rates"),
+        ],
+        [
+            InlineKeyboardButton(text="💬 Чат с админом", callback_data="help_chat_with_admin"),
         ],
     ])
     
@@ -610,7 +844,7 @@ async def management_handler(message: types.Message):
     await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
 
 @dp.message(lambda message: message.text == "📈 Аналитика")
-async def analytics_handler(message: types.Message):
+async def analytics_handler(message: types.Message, state: FSMContext):
     """Обработчик кнопки 'Аналитика' (только для админов)."""
     user_id = message.from_user.id
     
@@ -622,14 +856,96 @@ async def analytics_handler(message: types.Message):
         return
     
     text = (
-        "📈 <b>Аналитика</b>\n\n"
-        "Функция аналитики будет доступна в ближайшее время.\n\n"
-        "Здесь можно будет:\n"
-        "• Просматривать общую статистику по заказам\n"
-        "• Анализировать продажи\n"
-        "• Получать отчеты по периодам"
+        "📈 <b>Аналитика участника</b>\n\n"
+        "Введи данные участника для получения подробной аналитики:\n\n"
+        "• <b>Ozon ID</b> (например: 19632916)\n"
+        "• <b>Telegram username</b> (например: @username или username)\n"
+        "• <b>Telegram ID</b> (например: 123456789)\n\n"
+        "Или отправь /cancel для отмены."
     )
+    
+    await state.set_state(ParticipantAnalytics.waiting_for_participant_data)
     await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+
+@dp.message(ParticipantAnalytics.waiting_for_participant_data)
+async def process_participant_analytics_input(message: types.Message, state: FSMContext):
+    """Обрабатывает ввод данных участника для аналитики."""
+    user_id = message.from_user.id
+    
+    if not is_admin(user_id):
+        await state.clear()
+        return
+    
+    # Проверяем команду отмены
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=get_keyboard(user_id))
+        return
+    
+    # Проверяем, не нажата ли кнопка
+    button_texts = ["📊 Моя статистика", "📦 Мои заказы", "👥 Управление", 
+                     "📈 Аналитика", "⚙️ Настройки", "👥 Пригласить друга", 
+                     "💸 Вывести бонусы", "❓ Помощь", "💬 Чат с админом"]
+    if message.text in button_texts:
+        await state.clear()
+        return
+    
+    user_input = message.text.strip()
+    participant = None
+    
+    # Определяем тип ввода и ищем участника
+    if user_input.isdigit():
+        # Может быть Ozon ID или Telegram ID
+        # Сначала пробуем как Ozon ID
+        participant = await asyncio.to_thread(find_participant_by_ozon_id, user_input)
+        
+        # Если не найден, пробуем как Telegram ID
+        if not participant:
+            try:
+                telegram_id = int(user_input)
+                participant = await asyncio.to_thread(find_participant_by_telegram_id, telegram_id)
+            except ValueError:
+                pass
+    else:
+        # Пробуем как username
+        participant = await asyncio.to_thread(find_participant_by_username, user_input)
+    
+    if not participant:
+        await message.answer(
+            f"❌ Участник не найден по запросу: <code>{user_input}</code>\n\n"
+            f"Проверь правильность ввода и попробуй еще раз.\n"
+            f"Или отправь /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(user_id)
+        )
+        return
+    
+    # Участник найден - генерируем аналитику
+    ozon_id = participant.get("Ozon ID")
+    await state.clear()
+    
+    # Показываем сообщение о загрузке
+    loading_msg = await message.answer("⏳ Генерирую аналитику...", reply_markup=get_keyboard(user_id))
+    
+    try:
+        # Генерируем аналитику
+        analytics_parts = await generate_participant_analytics(ozon_id)
+        
+        # Удаляем сообщение о загрузке
+        await loading_msg.delete()
+        
+        # Отправляем части аналитики
+        for i, part in enumerate(analytics_parts, 1):
+            if i == 1:
+                await message.answer(part, parse_mode="HTML", reply_markup=get_keyboard(user_id))
+            else:
+                await message.answer(part, parse_mode="HTML")
+    except Exception as e:
+        await loading_msg.delete()
+        await message.answer(
+            f"❌ Ошибка при генерации аналитики: {str(e)}",
+            reply_markup=get_keyboard(user_id)
+        )
 
 @dp.message(lambda message: message.text == "⚙️ Настройки")
 async def settings_handler(message: types.Message):
@@ -652,6 +968,12 @@ async def settings_handler(message: types.Message):
         f"Количество уровней: <b>{settings.max_levels}</b>\n\n"
     )
     
+    # Показываем уровень 0 (покупки самого участника)
+    level_0_percent = getattr(settings, 'level_0_percent', 0.0)
+    if level_0_percent is not None:
+        text += f"Уровень 0 (покупки участника): <b>{level_0_percent}%</b>\n"
+    
+    # Показываем уровни 1-5
     for level in range(1, min(settings.max_levels + 1, 6)):  # Ограничиваем до 5 уровней
         percent = getattr(settings, f'level_{level}_percent', 0.0)
         if percent is not None:
@@ -771,6 +1093,107 @@ async def help_bonus_rates_handler(callback: types.CallbackQuery):
     
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
 
+@dp.callback_query(lambda c: c.data == "help_chat_with_admin")
+async def help_chat_with_admin_handler(callback: types.CallbackQuery):
+    """Обработчик кнопки 'Чат с админом' в разделе помощи."""
+    await callback.answer()
+    
+    user = callback.from_user
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
+    
+    if not participant:
+        text = (
+            "❌ Ты еще не зарегистрирован в программе.\n\n"
+            "Сначала зарегистрируйся через команду /start."
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+            ]
+        ])
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+    
+    # Получаем информацию о первом админе
+    if not ADMIN_IDS:
+        text = "❌ Администратор временно недоступен. Попробуй позже."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+            ]
+        ])
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+    
+    admin_id = ADMIN_IDS[0]  # Берем первого админа
+    admin_info = await get_admin_contact_info(admin_id)
+    
+    if not admin_info:
+        text = "❌ Не удалось получить контакт администратора. Попробуй позже."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+            ]
+        ])
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+    
+    # Если у админа есть username
+    if admin_info["has_username"]:
+        username = admin_info["username"]
+        text = (
+            f"💬 <b>Чат с администратором</b>\n\n"
+            f"Нажми на кнопку ниже, чтобы написать администратору напрямую:\n\n"
+            f"Или напиши ему в Telegram: @{username}\n\n"
+            f"💡 <b>Как это работает:</b>\n"
+            f"• Нажми на кнопку выше или напиши администратору напрямую\n"
+            f"• Вся переписка будет в вашем личном чате в Telegram\n"
+            f"• Администратор ответит в ближайшее время"
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Написать администратору",
+                    url=f"https://t.me/{username}"
+                )
+            ],
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+            ]
+        ])
+        
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    
+    # Если username нет - отправляем инструкцию
+    else:
+        admin_name = admin_info["first_name"] or "Администратор"
+        if admin_info.get("last_name"):
+            admin_name += f" {admin_info['last_name']}"
+        
+        text = (
+            f"💬 <b>Чат с администратором</b>\n\n"
+            f"Администратор: <b>{admin_name}</b>\n\n"
+            f"Чтобы связаться с администратором:\n"
+            f"1. Открой Telegram\n"
+            f"2. Найди пользователя по имени: <b>{admin_name}</b>\n"
+            f"3. Напиши ему напрямую\n\n"
+            f"Или попроси администратора добавить username в настройках Telegram для более удобной связи.\n\n"
+            f"💡 <b>Как это работает:</b>\n"
+            f"• Напиши администратору напрямую в Telegram\n"
+            f"• Вся переписка будет в вашем личном чате в Telegram\n"
+            f"• Администратор ответит в ближайшее время"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="help_main"),
+            ]
+        ])
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    
+    # Уведомляем админа о новом запросе
+    await notify_admin_about_chat_request(admin_id, user, participant)
+
 @dp.callback_query(lambda c: c.data == "bonus_edit_levels")
 async def bonus_edit_levels_handler(callback: types.CallbackQuery, state: FSMContext):
     """Начать редактирование количества уровней."""
@@ -801,8 +1224,21 @@ async def bonus_edit_percents_handler(callback: types.CallbackQuery, state: FSMC
     
     text = "📝 <b>Редактирование процентов бонусов</b>\n\n"
     
-    # Создаем кнопки для каждого уровня (ограничиваем до 5 уровней)
+    # Создаем кнопки для каждого уровня
     keyboard_buttons = []
+    
+    # Кнопка для уровня 0 (покупки самого участника)
+    level_0_percent = getattr(settings, 'level_0_percent', 0.0)
+    if level_0_percent is None:
+        level_0_percent = 0.0
+    keyboard_buttons.append([
+        InlineKeyboardButton(
+            text=f"Уровень 0 - покупки участника ({level_0_percent}%)",
+            callback_data="bonus_edit_level_0"
+        )
+    ])
+    
+    # Кнопки для уровней 1-5 (ограничиваем до 5 уровней)
     for level in range(1, min(settings.max_levels + 1, 6)):
         percent = getattr(settings, f'level_{level}_percent', 0.0)
         if percent is None:
@@ -834,8 +1270,14 @@ async def bonus_edit_single_percent_handler(callback: types.CallbackQuery, state
     settings = await asyncio.to_thread(get_bonus_settings)
     current_percent = getattr(settings, f'level_{level}_percent', 0.0)
     
+    # Формируем текст в зависимости от уровня
+    if level == 0:
+        level_text = "уровня 0 (покупки самого участника)"
+    else:
+        level_text = f"уровня {level}"
+    
     text = (
-        f"📝 <b>Редактирование процента для уровня {level}</b>\n\n"
+        f"📝 <b>Редактирование процента для {level_text}</b>\n\n"
         f"Текущее значение: <b>{current_percent}%</b>\n\n"
         f"Введи новый процент (например: 5.5 для 5.5%):"
     )
@@ -905,28 +1347,38 @@ async def leave_program_confirm_handler(callback: types.CallbackQuery, state: FS
     await callback.answer()
     
     user = callback.from_user
-    result = await asyncio.to_thread(delete_participant, user.id)
+    result = await asyncio.to_thread(deactivate_participant, user.id)
     
     if result.get("success"):
         referrals_count = result.get("referrals_count", 0)
         ozon_id = result.get("ozon_id", "")
+        was_already_inactive = result.get("was_already_inactive", False)
         
         # Формируем сообщение о выходе
         referrals_text = ""
         if referrals_count > 0:
-            referrals_text = f"\n\n⚠️ У <b>{referrals_count}</b> твоих реферал"
+            referrals_text = f"\n\n📋 У тебя <b>{referrals_count}</b> реферал"
             if referrals_count == 1:
-                referrals_text += "а была удалена связь с тобой."
+                referrals_text += "а"
             elif referrals_count < 5:
-                referrals_text += "ов была удалена связь с тобой."
+                referrals_text += "ов"
             else:
-                referrals_text += "ов была удалена связь с тобой."
+                referrals_text += "ов"
+            referrals_text += ". Твоя реферальная сеть сохранена."
         
-        text = (
-            f"✅ <b>Ты успешно вышел из программы</b>\n\n"
-            f"Твой аккаунт (Ozon ID: {ozon_id}) был удален из программы.{referrals_text}\n\n"
-            f"💡 Если захочешь вернуться, можешь заново зарегистрироваться через команду /start."
-        )
+        if was_already_inactive:
+            text = (
+                f"ℹ️ <b>Ты уже неактивен в программе</b>\n\n"
+                f"Твой аккаунт (Ozon ID: {ozon_id}) уже был деактивирован.{referrals_text}\n\n"
+                f"💡 Чтобы вернуться, зарегистрируйся заново через команду /start."
+            )
+        else:
+            text = (
+                f"✅ <b>Ты успешно вышел из программы</b>\n\n"
+                f"Твой аккаунт (Ozon ID: {ozon_id}) деактивирован.{referrals_text}\n\n"
+                f"💡 Твоя реферальная сеть сохранена. Если захочешь вернуться, "
+                f"зарегистрируйся заново через команду /start - все твои рефералы останутся на месте."
+            )
         
         await callback.message.edit_text(text, parse_mode="HTML")
         await state.clear()
@@ -1074,10 +1526,11 @@ async def process_ozon_id(message: types.Message, state: FSMContext):
 # Глобальный флаг для отслеживания процесса синхронизации
 _sync_in_progress = False
 _sync_task: asyncio.Task = None
+_notification_task: asyncio.Task = None
 
-# Интервал синхронизации (12 часов)
-SYNC_INTERVAL_HOURS = 12
-SYNC_INTERVAL_SECONDS = SYNC_INTERVAL_HOURS * 3600
+# Время синхронизации заказов: 13:00 по московскому времени каждый день
+SYNC_TIME_HOUR = 13
+SYNC_TIME_MINUTE = 0
 
 async def perform_auto_sync(notify_admins: bool = False) -> bool:
     """
@@ -1106,7 +1559,19 @@ async def perform_auto_sync(notify_admins: bool = False) -> bool:
             print(f"✅ Автоматическая синхронизация завершена успешно. Добавлено заказов: {result.get('count', 0)}")
             
             # Уведомляем админов всегда, если запрошено (даже если заказов нет)
+            # #region agent log
+            try:
+                with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1109", "message": "BEFORE notify_admins check", "data": {"notify_admins": notify_admins, "result_count": result.get("count", 0)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+            except: pass
+            # #endregion
             if notify_admins:
+                # #region agent log
+                try:
+                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1110", "message": "CALLING notify_admins_about_sync", "data": {"notify_admins": True}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+                except: pass
+                # #endregion
                 await notify_admins_about_sync(result)
             
             return True
@@ -1129,6 +1594,12 @@ async def perform_auto_sync(notify_admins: bool = False) -> bool:
 async def notify_admins_about_sync(result: dict):
     """Отправляет уведомление админам об успешной синхронизации с детальной статистикой."""
     global bot
+    # #region agent log
+    try:
+        with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1129", "message": "notify_admins_about_sync ENTRY", "data": {"admin_ids": ADMIN_IDS, "bot_initialized": bot is not None}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C,E"}) + "\n")
+    except: pass
+    # #endregion
     try:
         period_start = result.get("period_start")
         period_end = result.get("period_end")
@@ -1200,12 +1671,42 @@ async def notify_admins_about_sync(result: dict):
                 f"{status_stats_text}"
             )
         
+        # #region agent log
+        try:
+            with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1203", "message": "BEFORE sending messages to admins", "data": {"admin_ids_count": len(ADMIN_IDS), "text_length": len(text)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C,D"}) + "\n")
+        except: pass
+        # #endregion
         for admin_id in ADMIN_IDS:
             try:
+                # #region agent log
+                try:
+                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1205", "message": "BEFORE send_message to admin", "data": {"admin_id": admin_id}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+                except: pass
+                # #endregion
                 await bot.send_message(admin_id, text, parse_mode="HTML")
+                # #region agent log
+                try:
+                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1206", "message": "AFTER send_message to admin SUCCESS", "data": {"admin_id": admin_id}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+                except: pass
+                # #endregion
             except Exception as e:
+                # #region agent log
+                try:
+                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1207", "message": "EXCEPTION sending message to admin", "data": {"admin_id": admin_id, "error": str(e), "error_type": type(e).__name__}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+                except: pass
+                # #endregion
                 print(f"⚠️ Не удалось отправить уведомление админу {admin_id}: {e}")
     except Exception as e:
+        # #region agent log
+        try:
+            with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1209", "message": "EXCEPTION in notify_admins_about_sync", "data": {"error": str(e), "error_type": type(e).__name__}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+        except: pass
+        # #endregion
         print(f"⚠️ Ошибка при отправке уведомлений админам: {e}")
 
 async def notify_admins_about_sync_error(error_msg: str):
@@ -1266,10 +1767,459 @@ async def notify_referrer_about_new_registration(
         print(f"⚠️ Не удалось отправить уведомление рефереру {referrer_telegram_id}: {e}")
         return False
 
+async def notify_admin_about_chat_request(admin_id: int, user: types.User, participant: dict):
+    """Уведомляет админа о новом запросе на чат."""
+    global bot
+    try:
+        ozon_id = participant.get("Ozon ID", "Не указан")
+        user_name = user.first_name or "Пользователь"
+        username = f"@{user.username}" if user.username else "нет username"
+        
+        text = (
+            f"💬 <b>Новый запрос на чат</b>\n\n"
+            f"👤 <b>Пользователь:</b> {user_name} ({username})\n"
+            f"🆔 <b>Ozon ID:</b> {ozon_id}\n"
+            f"🆔 <b>Telegram ID:</b> {user.id}\n\n"
+            f"Пользователь запросил возможность связаться с тобой. Ожидай сообщения от него."
+        )
+        
+        await bot.send_message(admin_id, text, parse_mode="HTML")
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить уведомление админу: {e}")
+
+def format_number(num):
+    """Форматирует число с пробелами."""
+    try:
+        return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+    except (ValueError, TypeError):
+        return "0,00"
+
+def format_int(num):
+    """Форматирует целое число с пробелами."""
+    try:
+        return f"{int(num):,}".replace(',', ' ')
+    except (ValueError, TypeError):
+        return "0"
+
+async def generate_participant_analytics(ozon_id: str) -> list[str]:
+    """Генерирует подробную аналитику по участнику. Возвращает список строк для отправки."""
+    
+    def split_text(text: str, max_length: int = 4000) -> list[str]:
+        """Разбивает текст на части по max_length символов."""
+        if len(text) <= max_length:
+            return [text]
+        
+        parts = []
+        current_part = ""
+        
+        for line in text.split('\n'):
+            if len(current_part) + len(line) + 1 <= max_length:
+                current_part += line + '\n'
+            else:
+                if current_part:
+                    parts.append(current_part.strip())
+                current_part = line + '\n'
+        
+        if current_part:
+            parts.append(current_part.strip())
+        
+        return parts
+    
+    try:
+        # Получаем базовую информацию
+        participant = await asyncio.to_thread(find_participant_by_ozon_id, ozon_id)
+        if not participant:
+            return ["❌ Участник не найден"]
+        
+        # Получаем статистику
+        user_stats = await asyncio.to_thread(get_user_orders_stats, ozon_id)
+        summary = await asyncio.to_thread(get_user_orders_summary, ozon_id)
+        total_bonuses = await asyncio.to_thread(get_user_bonuses, ozon_id)
+        settings = await asyncio.to_thread(get_bonus_settings)
+        max_levels = settings.max_levels if settings else 3
+        referrals_by_level = await asyncio.to_thread(get_referrals_by_level, ozon_id, max_level=max_levels)
+        
+        # Формируем аналитику
+        analytics_text = ""
+        
+        # 1. Базовая информация
+        analytics_text += "=" * 50 + "\n"
+        analytics_text += f"📊 ПОДРОБНАЯ АНАЛИТИКА ПО УЧАСТНИКУ\n"
+        analytics_text += "=" * 50 + "\n\n"
+        
+        analytics_text += "👤 <b>БАЗОВАЯ ИНФОРМАЦИЯ</b>\n\n"
+        analytics_text += f"Ozon ID: <code>{participant.get('Ozon ID', 'Не указан')}</code>\n"
+        analytics_text += f"Имя / ник: {participant.get('Имя / ник', 'Не указано')}\n"
+        analytics_text += f"Telegram @: {participant.get('Телеграм @', 'Не указан')}\n"
+        analytics_text += f"Telegram ID: <code>{participant.get('Telegram ID', 'Не указан')}</code>\n"
+        analytics_text += f"Дата регистрации: {participant.get('Дата регистрации', 'Не указана')}\n"
+        
+        referrer_id = participant.get('ID пригласившего')
+        if referrer_id:
+            referrer = await asyncio.to_thread(find_participant_by_ozon_id, referrer_id)
+            if referrer:
+                analytics_text += f"Реферер: {referrer.get('Имя / ник', 'Не указано')} (Ozon ID: {referrer_id})\n"
+            else:
+                analytics_text += f"Реферер: Ozon ID {referrer_id} (не найден в базе)\n"
+        else:
+            analytics_text += "Реферер: Нет реферера\n"
+        
+        analytics_text += "\n"
+        
+        # 2. Статистика по заказам
+        analytics_text += "📦 <b>СТАТИСТИКА ПО ЗАКАЗАМ</b>\n\n"
+        analytics_text += f"Всего доставлено заказов: <b>{user_stats['delivered_count']}</b>\n"
+        analytics_text += f"Общая сумма доставленных: <b>{format_number(user_stats['total_sum'])}</b> ₽\n"
+        analytics_text += f"Всего заказов (с даты регистрации): <b>{summary['total_orders']}</b>\n"
+        analytics_text += f"Общая сумма всех заказов: <b>{format_number(summary['total_sum'])}</b> ₽\n\n"
+        
+        # Словарь для перевода статусов
+        status_names = {
+            "delivered": "✅ Доставлено",
+            "delivering": "🚚 В доставке",
+            "awaiting_packaging": "📦 Ожидает упаковки",
+            "awaiting_deliver": "⏳ Ожидает доставки",
+            "cancelled": "❌ Отменено",
+        }
+        
+        if summary.get('by_status'):
+            analytics_text += "Распределение по статусам:\n"
+            
+            sorted_statuses = sorted(
+                summary['by_status'].items(),
+                key=lambda x: x[1]['count'],
+                reverse=True
+            )
+            
+            for status, data in sorted_statuses:
+                status_name = status_names.get(status, f"❓ {status}")
+                count = data.get('count', 0)
+                sum_amount = data.get('sum', 0.0)
+                analytics_text += f"  {status_name}: {count} заказ(ов) — {format_number(sum_amount)} ₽\n"
+        
+        analytics_text += "\n"
+        
+        # Получаем последние 10 заказов
+        def get_last_orders(ozon_id: str, limit: int = 10):
+            """Получает последние заказы участника (без фильтрации по дате регистрации для админа)."""
+            db = SessionLocal()
+            try:
+                # Убираем фильтрацию по дате регистрации, чтобы показывать все заказы админу
+                query = db.query(Order).filter(Order.buyer_id == str(ozon_id))
+                
+                orders = query.order_by(Order.created_at.desc()).limit(limit).all()
+                return orders
+            finally:
+                db.close()
+        
+        last_orders = await asyncio.to_thread(get_last_orders, ozon_id, 10)
+        
+        if last_orders:
+            analytics_text += "📋 <b>ПОСЛЕДНИЕ 10 ЗАКАЗОВ</b>\n\n"
+            
+            for i, order in enumerate(last_orders, 1):
+                order_date = order.created_at.strftime("%d.%m.%Y %H:%M") if order.created_at else "Не указана"
+                status = order.status or "unknown"
+                status_name = status_names.get(status, f"❓ {status}")
+                price = format_number(order.price_amount) if order.price_amount else "0,00"
+                order_id = order.order_id or "Не указан"
+                
+                analytics_text += f"{i}. <b>{order_date}</b>\n"
+                analytics_text += f"   Статус: {status_name}\n"
+                analytics_text += f"   Сумма: {price} ₽\n"
+                analytics_text += f"   Номер заказа: <code>{order_id}</code>\n\n"
+        else:
+            analytics_text += "📋 <b>ПОСЛЕДНИЕ 10 ЗАКАЗОВ</b>\n\n"
+            analytics_text += "Заказы не найдены\n\n"
+        
+        # 3. Бонусы
+        analytics_text += "💰 <b>БОНУСЫ</b>\n\n"
+        analytics_text += f"Всего начислено бонусов: <b>{format_number(total_bonuses)}</b> ₽\n\n"
+        
+        analytics_text += "Бонусы по уровням:\n"
+        for level in range(1, max_levels + 1):
+            level_bonuses = await asyncio.to_thread(get_user_bonuses, ozon_id, level=level)
+            if level_bonuses > 0:
+                analytics_text += f"  Уровень {level}: {format_number(level_bonuses)} ₽\n"
+        
+        analytics_text += "\n"
+        
+        # 4. Реферальная программа
+        analytics_text += "👥 <b>РЕФЕРАЛЬНАЯ ПРОГРАММА</b>\n\n"
+        
+        total_referrals = 0
+        total_referral_orders = 0
+        total_referral_sum = 0.0
+        total_referral_bonuses = 0.0
+        
+        level_names = {
+            1: "Уровень 1 (прямые друзья)",
+            2: "Уровень 2 (друзья друзей)",
+            3: "Уровень 3 (друзья друзей друзей)",
+        }
+        
+        for level in range(1, max_levels + 1):
+            referral_ids = referrals_by_level.get(level, [])
+            
+            if referral_ids:
+                referrals_stats = await asyncio.to_thread(get_referrals_orders_stats, referral_ids)
+                referrals_bonuses = await asyncio.to_thread(get_referrals_bonuses_stats, referral_ids, level)
+                
+                total_referrals += len(referral_ids)
+                total_referral_orders += referrals_stats['orders_count']
+                total_referral_sum += referrals_stats['total_sum']
+                total_referral_bonuses += referrals_bonuses
+                
+                level_name = level_names.get(level, f"Уровень {level}")
+                analytics_text += f"{level_name}:\n"
+                analytics_text += f"  Участников: <b>{len(referral_ids)}</b>\n"
+                analytics_text += f"  Кол-во заказов: <b>{referrals_stats['orders_count']}</b>\n"
+                analytics_text += f"  Их сумма: <b>{format_number(referrals_stats['total_sum'])}</b> ₽\n"
+                analytics_text += f"  Начислено бонусов: <b>{format_number(referrals_bonuses)}</b> ₽\n\n"
+            else:
+                level_name = level_names.get(level, f"Уровень {level}")
+                analytics_text += f"{level_name}:\n"
+                analytics_text += f"  Участников: 0\n"
+                analytics_text += f"  Кол-во заказов: 0\n"
+                analytics_text += f"  Их сумма: 0 ₽\n"
+                analytics_text += f"  Начислено бонусов: 0 ₽\n\n"
+        
+        analytics_text += "─" * 50 + "\n"
+        analytics_text += "<b>ИТОГО ПО РЕФЕРАЛЬНОЙ ПРОГРАММЕ:</b>\n"
+        analytics_text += f"Всего рефералов: <b>{total_referrals}</b>\n"
+        analytics_text += f"Всего заказов рефералов: <b>{total_referral_orders}</b>\n"
+        analytics_text += f"Общая сумма заказов рефералов: <b>{format_number(total_referral_sum)}</b> ₽\n"
+        analytics_text += f"Всего бонусов от программы: <b>{format_number(total_referral_bonuses)}</b> ₽\n"
+        
+        # Разбиваем на части
+        return split_text(analytics_text, max_length=4000)
+        
+    except Exception as e:
+        return [f"❌ Ошибка при генерации аналитики: {str(e)}"]
+
+async def notify_user_about_daily_bonuses(
+    referrer_telegram_id: int,
+    bonus_summary: dict
+) -> bool:
+    """
+    Отправляет уведомление пользователю о начисленных бонусах за день.
+    
+    Args:
+        referrer_telegram_id: Telegram ID пользователя (реферера)
+        bonus_summary: Словарь со сводкой бонусов (результат get_daily_bonus_summary)
+    
+    Returns:
+        True если уведомление отправлено успешно, False в случае ошибки
+    """
+    global bot
+    
+    # Функция для форматирования чисел с пробелами
+    def format_number(num):
+        try:
+            return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+        except (ValueError, TypeError):
+            return "0,00"
+    
+    try:
+        if not bonus_summary or bonus_summary.get("total_amount", 0) == 0:
+            # Нет начислений - не отправляем уведомление
+            return False
+        
+        # Форматируем дату
+        date = bonus_summary.get("date")
+        if isinstance(date, str):
+            try:
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                date_str = date_obj.strftime("%d.%m.%Y")
+            except:
+                date_str = date
+        else:
+            date_str = date.strftime("%d.%m.%Y") if date else "сегодня"
+        
+        # Начинаем формировать текст сообщения
+        text = f"💰 <b>Начисления за {date_str}</b>\n\n"
+        
+        # Группируем по уровням
+        levels = bonus_summary.get("levels", {})
+        total_amount = bonus_summary.get("total_amount", 0)
+        
+        # Сортируем уровни по возрастанию
+        sorted_levels = sorted(levels.keys())
+        
+        for level in sorted_levels:
+            level_data = levels[level]
+            level_count = level_data.get("count", 0)
+            level_amount = level_data.get("total_amount", 0)
+            
+            if level_count > 0 and level_amount > 0:
+                text += f"🎯 <b>Уровень {level}:</b>\n"
+                text += f"• Бонусов начислено: {format_number(level_amount)} ₽ ({level_count} заказ"
+                
+                # Правильное склонение слова "заказ"
+                if level_count == 1:
+                    text += ")\n\n"
+                elif level_count < 5:
+                    text += "а)\n\n"
+                else:
+                    text += "ов)\n\n"
+        
+        # Итого
+        text += f"💵 <b>Итого:</b> {format_number(total_amount)} ₽"
+        
+        await bot.send_message(referrer_telegram_id, text, parse_mode="HTML")
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить уведомление о бонусах пользователю {referrer_telegram_id}: {e}")
+        return False
+
+async def send_daily_bonus_notifications(target_date: datetime = None):
+    """
+    Отправляет ежедневные уведомления о начисленных бонусах всем пользователям.
+    
+    Args:
+        target_date: Дата, за которую отправлять уведомления (по умолчанию - вчерашний день)
+    """
+    if target_date is None:
+        # Используем вчерашний день
+        target_date = datetime.now() - timedelta(days=1)
+    
+    print(f"🔄 Начало отправки ежедневных уведомлений о бонусах за {target_date.strftime('%d.%m.%Y')}")
+    
+    # Получаем всех участников программы
+    participants = await asyncio.to_thread(get_all_participants)
+    
+    if not participants:
+        print("ℹ️ Нет участников программы для отправки уведомлений")
+        return
+    
+    # Счетчики для статистики
+    sent_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    # Отправляем уведомления параллельно с ограничением через Semaphore
+    semaphore = asyncio.Semaphore(10)  # Максимум 10 одновременных отправок
+    
+    async def send_notification_to_user(participant: dict):
+        nonlocal sent_count, skipped_count, error_count
+        
+        async with semaphore:
+            try:
+                ozon_id = participant.get("Ozon ID")
+                telegram_id_str = participant.get("Telegram ID")
+                
+                if not ozon_id or not telegram_id_str:
+                    skipped_count += 1
+                    return
+                
+                # Преобразуем Telegram ID в int
+                try:
+                    telegram_id = int(telegram_id_str)
+                except (ValueError, TypeError):
+                    print(f"⚠️ Неверный Telegram ID для участника {ozon_id}: {telegram_id_str}")
+                    skipped_count += 1
+                    return
+                
+                # Получаем сводку бонусов за день
+                bonus_summary = await asyncio.to_thread(get_daily_bonus_summary, ozon_id, target_date)
+                
+                # Проверяем наличие начислений
+                if not bonus_summary or bonus_summary.get("total_amount", 0) == 0:
+                    # Нет начислений - пропускаем (не отправляем уведомление)
+                    skipped_count += 1
+                    return
+                
+                # Отправляем уведомление
+                success = await notify_user_about_daily_bonuses(telegram_id, bonus_summary)
+                
+                if success:
+                    sent_count += 1
+                else:
+                    error_count += 1
+                    
+            except Exception as e:
+                print(f"⚠️ Ошибка при обработке участника {participant.get('Ozon ID', 'unknown')}: {e}")
+                error_count += 1
+    
+    # Запускаем отправку уведомлений параллельно
+    tasks = [send_notification_to_user(p) for p in participants]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    print(f"✅ Отправка уведомлений завершена:")
+    print(f"   📨 Отправлено: {sent_count}")
+    print(f"   ⏭️  Пропущено (нет начислений): {skipped_count}")
+    print(f"   ❌ Ошибок: {error_count}")
+
+def get_moscow_time() -> datetime:
+    """Получить текущее время в московском часовом поясе (UTC+3).
+    
+    Returns:
+        datetime: Текущее время с учетом московского часового пояса
+    """
+    # Простое решение: добавляем 3 часа к UTC
+    # Для более точной работы можно использовать pytz или zoneinfo, но это требует дополнительных зависимостей
+    utc_now = datetime.utcnow()
+    moscow_offset = timedelta(hours=3)
+    return utc_now + moscow_offset
+
+async def daily_notification_task():
+    """
+    Фоновая задача для ежедневной отправки уведомлений о бонусах.
+    Запускается в 20:00 по московскому времени каждый день.
+    """
+    print(f"🔄 Запущена фоновая задача ежедневных уведомлений о бонусах (время отправки: 20:00 МСК)")
+    
+    while True:
+        try:
+            # Получаем текущее московское время
+            moscow_time = get_moscow_time()
+            current_hour = moscow_time.hour
+            current_minute = moscow_time.minute
+            
+            # Целевое время отправки: 20:00 МСК
+            target_hour = 20
+            target_minute = 0
+            
+            # Вычисляем время до следующего запуска
+            if current_hour < target_hour or (current_hour == target_hour and current_minute < target_minute):
+                # Еще не наступило время отправки сегодня - ждем до 20:00
+                target_datetime = moscow_time.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            else:
+                # Время уже прошло - отправляем за сегодня, следующий запуск будет завтра
+                target_datetime = (moscow_time + timedelta(days=1)).replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            
+            # Вычисляем количество секунд до следующего запуска
+            wait_seconds = (target_datetime - moscow_time).total_seconds()
+            
+            if wait_seconds > 0:
+                wait_hours = wait_seconds / 3600
+                print(f"⏰ Следующая отправка уведомлений через {wait_hours:.1f} часов (в {target_datetime.strftime('%d.%m.%Y %H:%M')} МСК)")
+                await asyncio.sleep(wait_seconds)
+                # После ожидания пересчитываем московское время
+                moscow_time = get_moscow_time()
+            
+            # Отправляем уведомления (за вчерашний день от текущего московского времени)
+            yesterday = moscow_time - timedelta(days=1)
+            print(f"📨 Начало отправки ежедневных уведомлений о бонусах за {yesterday.strftime('%d.%m.%Y')}")
+            await send_daily_bonus_notifications(yesterday)
+            
+        except asyncio.CancelledError:
+            print("🛑 Фоновая задача ежедневных уведомлений отменена")
+            break
+        except Exception as e:
+            print(f"❌ Ошибка в фоновой задаче ежедневных уведомлений: {e}")
+            import traceback
+            traceback.print_exc()
+            # Продолжаем работу, даже если произошла ошибка
+            # Ждем 1 час перед следующей попыткой
+            await asyncio.sleep(3600)
+
 def should_sync_on_startup() -> bool:
     """
     Проверяет, нужно ли выполнить синхронизацию при старте бота.
-    Возвращает True, если прошло более 12 часов с последней синхронизации.
+    Возвращает True, если:
+    - Синхронизации еще не было, ИЛИ
+    - Сейчас уже после 13:00 МСК, а последняя синхронизация была вчера или раньше
     """
     last_sync_time = get_last_sync_timestamp()
     
@@ -1277,23 +2227,64 @@ def should_sync_on_startup() -> bool:
         # Первый запуск - нужно синхронизировать
         return True
     
-    time_since_last_sync = datetime.now() - last_sync_time
-    return time_since_last_sync >= timedelta(hours=SYNC_INTERVAL_HOURS)
+    # Получаем текущее московское время
+    moscow_time = get_moscow_time()
+    current_hour = moscow_time.hour
+    
+    # Если сейчас уже после 13:00, проверяем, была ли сегодня синхронизация
+    if current_hour >= SYNC_TIME_HOUR:
+        # Проверяем, была ли синхронизация сегодня
+        last_sync_date = last_sync_time.date()
+        today = moscow_time.date()
+        
+        # Если последняя синхронизация была не сегодня, нужно синхронизировать
+        return last_sync_date < today
+    
+    # Если сейчас до 13:00, проверяем, была ли синхронизация вчера после 13:00
+    yesterday = moscow_time.date() - timedelta(days=1)
+    last_sync_date = last_sync_time.date()
+    
+    # Если последняя синхронизация была вчера или раньше, и сейчас уже после полуночи, нужно синхронизировать
+    return last_sync_date < yesterday
 
 async def periodic_sync_task():
     """
-    Фоновая задача для периодической синхронизации каждые 12 часов.
+    Фоновая задача для ежедневной синхронизации заказов.
+    Запускается в 13:00 по московскому времени каждый день.
     """
-    global _sync_task
-    
-    print(f"🔄 Запущена фоновая задача периодической синхронизации (интервал: {SYNC_INTERVAL_HOURS} часов)")
+    print(f"🔄 Запущена фоновая задача ежедневной синхронизации заказов (время синхронизации: {SYNC_TIME_HOUR}:{SYNC_TIME_MINUTE:02d} МСК)")
     
     while True:
         try:
-            # Ждем 12 часов
-            await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+            # Получаем текущее московское время
+            moscow_time = get_moscow_time()
+            current_hour = moscow_time.hour
+            current_minute = moscow_time.minute
+            
+            # Целевое время синхронизации: 13:00 МСК
+            target_hour = SYNC_TIME_HOUR
+            target_minute = SYNC_TIME_MINUTE
+            
+            # Вычисляем время до следующего запуска
+            if current_hour < target_hour or (current_hour == target_hour and current_minute < target_minute):
+                # Еще не наступило время синхронизации сегодня - ждем до 13:00
+                target_datetime = moscow_time.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            else:
+                # Время уже прошло - следующий запуск будет завтра
+                target_datetime = (moscow_time + timedelta(days=1)).replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            
+            # Вычисляем количество секунд до следующего запуска
+            wait_seconds = (target_datetime - moscow_time).total_seconds()
+            
+            if wait_seconds > 0:
+                wait_hours = wait_seconds / 3600
+                print(f"⏰ Следующая синхронизация заказов через {wait_hours:.1f} часов (в {target_datetime.strftime('%d.%m.%Y %H:%M')} МСК)")
+                await asyncio.sleep(wait_seconds)
+                # После ожидания пересчитываем московское время
+                moscow_time = get_moscow_time()
             
             # Выполняем синхронизацию
+            print(f"🔄 Начало ежедневной синхронизации заказов в {moscow_time.strftime('%d.%m.%Y %H:%M')} МСК")
             await perform_auto_sync(notify_admins=True)
             
         except asyncio.CancelledError:
@@ -1301,6 +2292,8 @@ async def periodic_sync_task():
             break
         except Exception as e:
             print(f"❌ Критическая ошибка в фоновой задаче синхронизации: {e}")
+            import traceback
+            traceback.print_exc()
             # Продолжаем работу, даже если произошла ошибка
             # Ждем еще немного перед следующей попыткой
             await asyncio.sleep(60)  # 1 минута перед повтором
@@ -1365,19 +2358,33 @@ async def main():
     
     # Проверяем, нужно ли выполнить синхронизацию при старте
     if should_sync_on_startup():
-        print("🔄 Прошло более 12 часов с последней синхронизации, выполняем синхронизацию при старте...")
+        print("🔄 Выполняем синхронизацию при старте (прошло достаточно времени или еще не было синхронизации)...")
         await perform_auto_sync(notify_admins=False)  # Не уведомляем при старте, чтобы не спамить
     else:
+        moscow_time = get_moscow_time()
         last_sync_time = get_last_sync_timestamp()
         if last_sync_time:
-            time_since = datetime.now() - last_sync_time
-            print(f"⏰ Последняя синхронизация была {time_since.total_seconds() / 3600:.1f} часов назад, пропускаем при старте")
+            last_sync_date = last_sync_time.date()
+            today = moscow_time.date()
+            if last_sync_date == today:
+                print(f"⏰ Синхронизация уже была выполнена сегодня ({last_sync_time.strftime('%d.%m.%Y %H:%M')}), следующая будет в 13:00 МСК")
+            else:
+                print(f"⏰ Последняя синхронизация была {last_sync_date.strftime('%d.%m.%Y')}, следующая будет в 13:00 МСК")
         else:
-            print("ℹ️ Первая синхронизация будет выполнена через 12 часов")
+            next_sync_time = moscow_time.replace(hour=SYNC_TIME_HOUR, minute=SYNC_TIME_MINUTE, second=0, microsecond=0)
+            if moscow_time.hour >= SYNC_TIME_HOUR:
+                next_sync_time += timedelta(days=1)
+            wait_hours = (next_sync_time - moscow_time).total_seconds() / 3600
+            print(f"ℹ️ Первая синхронизация будет выполнена в {next_sync_time.strftime('%d.%m.%Y %H:%M')} МСК (через {wait_hours:.1f} часов)")
     
     # Запускаем фоновую задачу для периодической синхронизации
     _sync_task = asyncio.create_task(periodic_sync_task())
     print("✅ Фоновая задача периодической синхронизации запущена")
+    
+    # Запускаем фоновую задачу для ежедневных уведомлений о бонусах
+    global _notification_task
+    _notification_task = asyncio.create_task(daily_notification_task())
+    print("✅ Фоновая задача ежедневных уведомлений о бонусах запущена")
     
     try:
         try:
@@ -1399,6 +2406,16 @@ async def main():
             except asyncio.CancelledError:
                 pass
             print("✅ Фоновая задача синхронизации остановлена")
+        
+        # Отменяем фоновую задачу ежедневных уведомлений
+        if _notification_task and not _notification_task.done():
+            print("🛑 Останавливаем фоновую задачу ежедневных уведомлений...")
+            _notification_task.cancel()
+            try:
+                await _notification_task
+            except asyncio.CancelledError:
+                pass
+            print("✅ Фоновая задача ежедневных уведомлений остановлена")
         
         # Закрываем кастомную сессию при завершении (если она была создана)
         try:

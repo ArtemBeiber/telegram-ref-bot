@@ -9,7 +9,8 @@ from sqlalchemy import func  # Для работы с датами в SQL зап
 # Импортируем из db_manager новые функции и модель
 from db_manager import (
     get_db, Order, Customer, Participant, order_exists, 
-    create_or_update_customer, get_customer, accrue_bonuses_for_order
+    create_or_update_customer, get_customer, accrue_bonuses_for_order,
+    process_order_return, check_and_update_bonus_availability
 ) 
 # Используем БД для хранения времени синхронизации
 from db_manager import get_last_sync_timestamp, set_last_sync_timestamp, get_last_order_date, set_last_order_date 
@@ -521,6 +522,11 @@ def update_orders_sheet():
                 if posting_status == "delivered" and old_status != "delivered":
                     accrue_bonuses_for_order(posting_number, db)
                 
+                # Если статус изменился с "delivered" на "cancelled" (возврат товара)
+                if old_status == "delivered" and posting_status == "cancelled":
+                    # Обрабатываем возврат заказа и списываем бонусы
+                    process_order_return(posting_number, return_amount=None, db=db)
+                
                 # Обновляем другие поля, если они доступны
                 if financial_data:
                     existing_order.currency_code = financial_data.get("currency_code", existing_order.currency_code or "RUB")
@@ -701,6 +707,11 @@ def update_orders_sheet():
         
         # Сохраняем все новые записи за раз
         db.commit()
+        
+        # Обновляем доступность бонусов (проверяем, прошло ли 14 дней)
+        updated_bonuses_count = check_and_update_bonus_availability(db)
+        if updated_bonuses_count > 0:
+            print(f"Обновлено статусов доступности бонусов: {updated_bonuses_count}")
 
         sync_end_time = datetime.now()  # Время окончания синхронизации
 

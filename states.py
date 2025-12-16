@@ -9,3 +9,6 @@ class BonusSettings(StatesGroup):
 
 class LeavingProgram(StatesGroup):
     confirming_leave = State()
+
+class ParticipantAnalytics(StatesGroup):
+    waiting_for_participant_data = State()
