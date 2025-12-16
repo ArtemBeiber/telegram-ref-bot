@@ -6,7 +6,7 @@ import socket
 from datetime import datetime
 from collections import defaultdict
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -33,13 +33,29 @@ from db_manager import (
     get_last_sync_timestamp,
     get_daily_bonus_summary,
     get_all_participants,
+    get_withdrawal_settings,
+    update_withdrawal_settings,
+    clear_withdrawal_settings_cache,
+    get_user_available_balance,
+    get_user_total_balance,
+    has_active_withdrawal_request,
+    get_active_withdrawal_request,
+    check_withdrawal_period,
+    create_withdrawal_request,
+    get_user_withdrawal_requests,
+    get_pending_withdrawal_requests,
+    get_withdrawal_request_by_id,
+    cancel_withdrawal_request,
+    approve_withdrawal_request,
+    reject_withdrawal_request,
+    complete_withdrawal_request,
     SessionLocal,
     Order,
     BonusTransaction,
     Participant,
 )
 
-from states import Registration, BonusSettings, LeavingProgram, ParticipantAnalytics
+from states import Registration, BonusSettings, LeavingProgram, Withdrawal, WithdrawalRejection, ParticipantAnalytics, WithdrawalSettings
 # ИМПОРТ ДЛЯ СИНХРОНИЗАЦИИ ЗАКАЗОВ
 from orders_updater import update_orders_sheet 
 
@@ -74,6 +90,109 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 # =========================================================
+# КОНСТАНТЫ ДЛЯ ВАЛИДАЦИИ
+# =========================================================
+MAX_TEXT_LENGTH = 1000  # Максимальная длина текстовых полей
+MAX_OZON_ID_LENGTH = 50  # Максимальная длина Ozon ID
+MAX_USERNAME_LENGTH = 100  # Максимальная длина username
+MAX_WITHDRAWAL_AMOUNT = 1000000.0  # Максимальная сумма вывода
+MIN_WITHDRAWAL_AMOUNT = 0.01  # Минимальная сумма вывода
+MAX_BONUS_PERCENT = 100.0  # Максимальный процент бонуса
+MIN_BONUS_PERCENT = 0.0  # Минимальный процент бонуса
+MAX_LEVELS = 5  # Максимальное количество уровней
+MIN_LEVELS = 1  # Минимальное количество уровней
+
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БЕЗОПАСНОСТИ
+# =========================================================
+def safe_extract_id(callback_data: str, prefix: str) -> int | None:
+    """
+    Безопасно извлекает ID из callback_data.
+    
+    Args:
+        callback_data: Данные callback (например, "admin_withdrawal_123")
+        prefix: Префикс для проверки (например, "admin_withdrawal_")
+        
+    Returns:
+        int | None: Извлеченный ID или None при ошибке
+    """
+    try:
+        if not callback_data.startswith(prefix):
+            return None
+        
+        # Извлекаем ID после последнего подчеркивания
+        id_str = callback_data.split("_")[-1]
+        if not id_str.isdigit():
+            return None
+        
+        return int(id_str)
+    except (ValueError, AttributeError, IndexError):
+        return None
+
+def sanitize_html(text: str) -> str:
+    """
+    Экранирует HTML-символы для безопасного отображения.
+    
+    Args:
+        text: Текст для экранирования
+        
+    Returns:
+        str: Экранированный текст
+    """
+    if not text:
+        return ""
+    
+    # Экранируем основные HTML-символы
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    text = text.replace('"', "&quot;")
+    text = text.replace("'", "&#x27;")
+    
+    return text
+
+def validate_text_length(text: str, max_length: int, field_name: str = "Текст") -> tuple[bool, str | None]:
+    """
+    Проверяет длину текста.
+    
+    Args:
+        text: Текст для проверки
+        max_length: Максимальная допустимая длина
+        field_name: Название поля для сообщения об ошибке
+        
+    Returns:
+        tuple[bool, str | None]: (валидно, сообщение об ошибке)
+    """
+    if not text or not text.strip():
+        return False, f"{field_name} не может быть пустым."
+    
+    if len(text) > max_length:
+        return False, f"{field_name} слишком длинный. Максимальная длина: {max_length} символов."
+    
+    return True, None
+
+def validate_numeric_range(value: float, min_val: float, max_val: float, field_name: str = "Значение") -> tuple[bool, str | None]:
+    """
+    Проверяет, находится ли числовое значение в допустимом диапазоне.
+    
+    Args:
+        value: Значение для проверки
+        min_val: Минимальное допустимое значение
+        max_val: Максимальное допустимое значение
+        field_name: Название поля для сообщения об ошибке
+        
+    Returns:
+        tuple[bool, str | None]: (валидно, сообщение об ошибке)
+    """
+    if value < min_val:
+        return False, f"{field_name} должно быть не меньше {min_val}."
+    
+    if value > max_val:
+        return False, f"{field_name} должно быть не больше {max_val}."
+    
+    return True, None
+
+# =========================================================
 # СОЗДАНИЕ КЛАВИАТУР С КНОПКАМИ
 # =========================================================
 async def get_referral_link(bot: Bot, telegram_id: int) -> str:
@@ -82,7 +201,7 @@ async def get_referral_link(bot: Bot, telegram_id: int) -> str:
     bot_username = me.username
     return f"https://t.me/{bot_username}?start={telegram_id}"
 
-async def get_admin_contact_info(admin_id: int) -> dict:
+async def get_admin_contact_info(bot: Bot, admin_id: int) -> dict:
     """Получает информацию об админе для отправки контакта."""
     try:
         chat = await bot.get_chat(admin_id)
@@ -623,7 +742,7 @@ async def invite_friend_handler(message: types.Message):
     await message.answer(instruction_text, reply_markup=get_keyboard(user.id))
 
 @dp.message(lambda message: message.text == "💸 Вывести бонусы")
-async def withdrawal_bonuses_handler(message: types.Message):
+async def withdrawal_bonuses_handler(message: types.Message, state: FSMContext):
     """Обработчик кнопки 'Вывести бонусы'."""
     user = message.from_user
     participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
@@ -636,15 +755,286 @@ async def withdrawal_bonuses_handler(message: types.Message):
         )
         return
     
-    # Заглушка - функция в разработке
+    ozon_id = participant.get('Ozon ID')
+    if not ozon_id:
+        await message.answer(
+            "❌ Ошибка: Ozon ID не найден.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Проверка активной заявки
+    has_active = await asyncio.to_thread(has_active_withdrawal_request, ozon_id)
+    if has_active:
+        active_request = await asyncio.to_thread(get_active_withdrawal_request, ozon_id)
+        if active_request:
+            status_text = {
+                "processing": "Обрабатывается",
+                "approved": "Одобрена"
+            }.get(active_request.get("status"), active_request.get("status"))
+            
+            text = (
+                f"💸 <b>Вывод бонусов</b>\n\n"
+                f"❌ У тебя уже есть активная заявка на вывод.\n\n"
+                f"Сумма: {active_request.get('amount', 0):,.2f} ₽\n"
+                f"Статус: {status_text}\n"
+                f"Дата создания: {active_request.get('created_at').strftime('%d.%m.%Y %H:%M') if active_request.get('created_at') else 'Не указана'}\n\n"
+                f"Дождись обработки текущей заявки перед созданием новой."
+            )
+            await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+            return
+    
+    # Получаем настройки и баланс
+    settings = await asyncio.to_thread(get_withdrawal_settings)
+    available_balance = await asyncio.to_thread(get_user_available_balance, ozon_id)
+    
+    # Функция для форматирования чисел
+    def format_number(num):
+        try:
+            return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+        except (ValueError, TypeError):
+            return "0,00"
+    
     text = (
-        "💸 <b>Вывод бонусов</b>\n\n"
-        "⏳ Эта функция находится в разработке.\n\n"
-        "Скоро ты сможешь выводить накопленные бонусы на карту или электронный кошелек.\n\n"
-        "Следи за обновлениями! 🚀"
+        f"💸 <b>Вывод бонусов</b>\n\n"
+        f"💰 Доступный баланс: <b>{format_number(available_balance)}</b> ₽\n"
+        f"📊 Минимальная сумма вывода: <b>{format_number(settings.min_withdrawal_amount)}</b> ₽\n\n"
+        f"Введи сумму, которую хочешь вывести:"
     )
     
     await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user.id))
+    await state.set_state(Withdrawal.entering_amount)
+
+# Список всех кнопок для исключения из обработки состояния
+WITHDRAWAL_BUTTON_TEXTS = [
+    "📊 Моя статистика", "📦 Мои заказы", "👥 Пригласить друга", 
+    "❓ Помощь", "💸 Вывести бонусы", "🚪 Выйти из программы",
+    "👥 Управление", "📈 Аналитика", "⚙️ Настройки"
+]
+
+@dp.message(Withdrawal.entering_amount, F.text.in_(WITHDRAWAL_BUTTON_TEXTS))
+async def process_withdrawal_button_in_state(message: types.Message, state: FSMContext):
+    """Обработчик кнопок в состоянии ввода суммы вывода - очищает состояние и обрабатывает кнопку."""
+    await state.clear()
+    
+    # Вызываем обработчик кнопки через диспетчер
+    from aiogram.types import Update
+    
+    new_update = Update(update_id=message.message_id, message=message)
+    
+    try:
+        await dp.feed_update(bot, new_update)
+    except Exception:
+        # Если feed_update не работает, состояние уже очищено
+        # Пользователю нужно будет нажать кнопку еще раз
+        pass
+
+@dp.message(Withdrawal.entering_amount, ~F.text.in_(WITHDRAWAL_BUTTON_TEXTS))
+async def process_withdrawal_amount(message: types.Message, state: FSMContext):
+    """Обработчик ввода суммы вывода (не обрабатывает кнопки)."""
+    user = message.from_user
+    participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
+    
+    if not participant:
+        await state.clear()
+        await message.answer(
+            "❌ Ты еще не зарегистрирован в программе.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    ozon_id = participant.get('Ozon ID')
+    if not ozon_id:
+        await state.clear()
+        await message.answer(
+            "❌ Ошибка: Ozon ID не найден.",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Парсим сумму
+    try:
+        # Убираем пробелы и заменяем запятую на точку
+        amount_str = message.text.strip().replace(' ', '').replace(',', '.')
+        amount = float(amount_str)
+    except ValueError:
+        # #region agent log
+        try:
+            with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:process_withdrawal_amount", "message": "VALUE_ERROR", "data": {"message_text": message.text, "amount_str": amount_str}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+        except: pass
+        # #endregion
+        settings = await asyncio.to_thread(get_withdrawal_settings)
+        await message.answer(
+            f"❌ Неверный формат суммы. Введи число (например: 1000 или 1000.50).\n\n"
+            f"Минимальная сумма вывода: {settings.min_withdrawal_amount:,.2f} ₽",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Получаем настройки и баланс
+    settings = await asyncio.to_thread(get_withdrawal_settings)
+    available_balance = await asyncio.to_thread(get_user_available_balance, ozon_id)
+    
+    # Валидация суммы - проверка диапазона
+    max_allowed = min(available_balance, MAX_WITHDRAWAL_AMOUNT)
+    is_valid, error_msg = validate_numeric_range(amount, MIN_WITHDRAWAL_AMOUNT, max_allowed, "Сумма вывода")
+    if not is_valid:
+        await message.answer(
+            f"❌ {error_msg}\n\n"
+            f"Доступный баланс: <b>{available_balance:,.2f}</b> ₽\n"
+            f"Минимальная сумма: <b>{settings.min_withdrawal_amount:,.2f}</b> ₽\n\n"
+            f"Попробуй еще раз:",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Дополнительная проверка минимальной суммы из настроек
+    if amount < settings.min_withdrawal_amount:
+        await message.answer(
+            f"❌ Минимальная сумма вывода: <b>{settings.min_withdrawal_amount:,.2f}</b> ₽\n\n"
+            f"Попробуй еще раз:",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    if amount > available_balance:
+        await message.answer(
+            f"❌ Недостаточно средств.\n\n"
+            f"Доступный баланс: <b>{available_balance:,.2f}</b> ₽\n\n"
+            f"Попробуй еще раз:",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
+    # Сохраняем сумму в состоянии
+    await state.update_data(amount=amount, ozon_id=ozon_id)
+    
+    # Переходим к подтверждению
+    def format_number(num):
+        try:
+            return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+        except (ValueError, TypeError):
+            return "0,00"
+    
+    remaining_balance = available_balance - amount
+    
+    text = (
+        f"💸 <b>Подтверждение заявки на вывод</b>\n\n"
+        f"Сумма вывода: <b>{format_number(amount)}</b> ₽\n"
+        f"Доступный баланс: {format_number(available_balance)} ₽\n"
+        f"После вывода останется: <b>{format_number(remaining_balance)}</b> ₽\n\n"
+        f"После подтверждения администратор свяжется с тобой для уточнения способа выплаты."
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="withdrawal_confirm"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data="withdrawal_cancel"),
+        ]
+    ])
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    await state.set_state(Withdrawal.confirming)
+
+@dp.callback_query(lambda c: c.data == "withdrawal_confirm")
+async def withdrawal_confirm_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения заявки на вывод."""
+    await callback.answer()
+    
+    user = callback.from_user
+    data = await state.get_data()
+    amount = data.get("amount")
+    ozon_id = data.get("ozon_id")
+    
+    if not amount or not ozon_id:
+        await callback.message.edit_text(
+            "❌ Ошибка: данные не найдены. Попробуй создать заявку заново.",
+            reply_markup=None
+        )
+        await state.clear()
+        return
+    
+    try:
+        # Создаем заявку
+        request = await asyncio.to_thread(
+            create_withdrawal_request,
+            ozon_id,
+            str(user.id),
+            amount
+        )
+        
+        # Уведомление пользователю
+        def format_number(num):
+            try:
+                return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+            except (ValueError, TypeError):
+                return "0,00"
+        
+        text = (
+            f"✅ <b>Заявка на вывод создана!</b>\n\n"
+            f"Сумма: <b>{format_number(amount)}</b> ₽\n"
+            f"Статус: Обрабатывается\n\n"
+            f"Администратор свяжется с тобой в ближайшее время для уточнения способа выплаты."
+        )
+        
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
+        await state.clear()
+        
+        # Уведомление первому админу
+        if ADMIN_IDS:
+            admin_id = ADMIN_IDS[0]
+            participant = await asyncio.to_thread(find_participant_by_telegram_id, user.id)
+            user_name = participant.get('Имя / ник', '') if participant else user.first_name or 'Пользователь'
+            user_username = participant.get('Телеграм @', '') if participant else (f"@{user.username}" if user.username else "")
+            
+            admin_text = (
+                f"💸 <b>Новая заявка на вывод бонусов</b>\n\n"
+                f"👤 Пользователь: {user_name} {user_username}\n"
+                f"🆔 Ozon ID: {ozon_id}\n"
+                f"💰 Сумма: <b>{format_number(amount)}</b> ₽\n"
+                f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"Свяжись с пользователем для уточнения способа выплаты."
+            )
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Просмотреть заявки", callback_data="admin_withdrawals_list")]
+            ])
+            
+            try:
+                await bot.send_message(admin_id, admin_text, parse_mode="HTML", reply_markup=keyboard)
+            except Exception as e:
+                print(f"⚠️ Не удалось отправить уведомление админу: {e}")
+        
+    except ValueError as e:
+        # Ошибка валидации
+        await callback.message.edit_text(
+            f"❌ {str(e)}\n\nПопробуй создать заявку заново.",
+            reply_markup=None
+        )
+        await state.clear()
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ Произошла ошибка при создании заявки: {str(e)}\n\nПопробуй позже.",
+            reply_markup=None
+        )
+        await state.clear()
+
+@dp.callback_query(lambda c: c.data == "withdrawal_cancel")
+async def withdrawal_cancel_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик отмены создания заявки на вывод."""
+    await callback.answer("Отменено")
+    
+    text = (
+        "❌ <b>Создание заявки отменено</b>\n\n"
+        "Ты можешь создать новую заявку в любое время."
+    )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
+    await state.clear()
 
 @dp.message(lambda message: message.text == "❓ Помощь")
 async def help_handler(message: types.Message):
@@ -674,7 +1064,7 @@ async def chat_with_admin_handler(message: types.Message):
         return
     
     admin_id = ADMIN_IDS[0]  # Берем первого админа
-    admin_info = await get_admin_contact_info(admin_id)
+    admin_info = await get_admin_contact_info(message.bot, admin_id)
     
     if not admin_info:
         await message.answer(
@@ -843,6 +1233,420 @@ async def management_handler(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
 
+@dp.callback_query(lambda c: c.data == "admin_withdrawals_list")
+async def admin_withdrawals_list_handler(callback: types.CallbackQuery):
+    """Обработчик просмотра списка заявок на вывод (для админов)."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    # Получаем список заявок
+    requests = await asyncio.to_thread(get_pending_withdrawal_requests)
+    
+    if not requests:
+        text = (
+            "💸 <b>Заявки на вывод бонусов</b>\n\n"
+            "✅ Нет заявок, ожидающих обработки."
+        )
+        await callback.message.edit_text(text, parse_mode="HTML")
+        return
+    
+    # Формируем список заявок
+    text = "💸 <b>Заявки на вывод бонусов</b>\n\n"
+    
+    def format_number(num):
+        try:
+            return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+        except (ValueError, TypeError):
+            return "0,00"
+    
+    keyboard_buttons = []
+    for req in requests[:10]:  # Ограничиваем до 10 заявок
+        user_display = req.get("user_name", "Пользователь")
+        if req.get("user_username"):
+            user_display += f" {req['user_username']}"
+        
+        text += (
+            f"<b>Заявка #{req['id']}</b>\n"
+            f"👤 {user_display}\n"
+            f"🆔 Ozon ID: {req['user_ozon_id']}\n"
+            f"💰 Сумма: {format_number(req['amount'])} ₽\n"
+            f"📅 {req['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
+        )
+        
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                text=f"Заявка #{req['id']} - {format_number(req['amount'])} ₽",
+                callback_data=f"admin_withdrawal_{req['id']}"
+            )
+        ])
+    
+    keyboard_buttons.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_withdrawals_close")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data == "admin_withdrawals_close")
+async def admin_withdrawals_close_handler(callback: types.CallbackQuery):
+    """Закрыть список заявок."""
+    await callback.answer()
+    await callback.message.delete()
+
+@dp.callback_query(lambda c: c.data.startswith("admin_withdrawal_"))
+async def admin_withdrawal_detail_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик просмотра деталей заявки на вывод."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    request_id = safe_extract_id(callback.data, "admin_withdrawal_")
+    if request_id is None:
+        await callback.message.edit_text(
+            "❌ Ошибка: неверный формат данных.",
+            reply_markup=None
+        )
+        return
+    
+    request = await asyncio.to_thread(get_withdrawal_request_by_id, request_id)
+    
+    if not request:
+        await callback.message.edit_text(
+            "❌ Заявка не найдена.",
+            reply_markup=None
+        )
+        return
+    
+    def format_number(num):
+        try:
+            return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+        except (ValueError, TypeError):
+            return "0,00"
+    
+    user_display = request.get("user_name", "Пользователь")
+    if request.get("user_username"):
+        user_display += f" {request['user_username']}"
+    
+    status_text = {
+        "processing": "Обрабатывается",
+        "approved": "Одобрена",
+        "rejected": "Отклонена",
+        "completed": "Выполнена"
+    }.get(request.get("status"), request.get("status"))
+    
+    text = (
+        f"💸 <b>Заявка #{request_id}</b>\n\n"
+        f"👤 Пользователь: {user_display}\n"
+        f"📱 Telegram ID: {request['user_telegram_id']}\n"
+        f"🆔 Ozon ID: {request['user_ozon_id']}\n"
+        f"💰 Сумма: <b>{format_number(request['amount'])}</b> ₽\n"
+        f"📊 Статус: {status_text}\n"
+        f"📅 Дата: {request['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
+    )
+    
+    if request.get("admin_comment"):
+        text += f"\n💬 Комментарий: {request['admin_comment']}"
+    
+    keyboard_buttons = []
+    
+    # Кнопки действий в зависимости от статуса
+    if request.get("status") == "processing":
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"admin_withdrawal_approve_{request_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_withdrawal_reject_{request_id}")
+        ])
+    elif request.get("status") == "approved":
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="✅ Завершить выплату", callback_data=f"admin_withdrawal_complete_{request_id}")
+        ])
+    
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="🔙 Назад к списку", callback_data="admin_withdrawals_list")
+    ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data.startswith("admin_withdrawal_approve_"))
+async def admin_withdrawal_approve_handler(callback: types.CallbackQuery):
+    """Обработчик одобрения заявки на вывод."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    request_id = safe_extract_id(callback.data, "admin_withdrawal_approve_")
+    if request_id is None:
+        await callback.message.edit_text(
+            "❌ Ошибка: неверный формат данных.",
+            reply_markup=None
+        )
+        return
+    
+    request = await asyncio.to_thread(get_withdrawal_request_by_id, request_id)
+    
+    if not request or request.get("status") != "processing":
+        await callback.message.edit_text(
+            "❌ Заявка не найдена или уже обработана.",
+            reply_markup=None
+        )
+        return
+    
+    def format_number(num):
+        try:
+            return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+        except (ValueError, TypeError):
+            return "0,00"
+    
+    text = (
+        f"✅ <b>Одобрить заявку на вывод?</b>\n\n"
+        f"Пользователь: {request.get('user_name', 'Пользователь')}\n"
+        f"Сумма: <b>{format_number(request['amount'])}</b> ₽\n\n"
+        f"После одобрения бонусы будут списаны, и ты сможешь связаться с пользователем для уточнения способа выплаты."
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, одобрить", callback_data=f"admin_withdrawal_approve_confirm_{request_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_withdrawal_{request_id}")
+        ]
+    ])
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data.startswith("admin_withdrawal_approve_confirm_"))
+async def admin_withdrawal_approve_confirm_handler(callback: types.CallbackQuery):
+    """Обработчик подтверждения одобрения заявки."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    request_id = safe_extract_id(callback.data, "admin_withdrawal_approve_confirm_")
+    if request_id is None:
+        await callback.message.edit_text(
+            "❌ Ошибка: неверный формат данных.",
+            reply_markup=None
+        )
+        return
+    
+    try:
+        success = await asyncio.to_thread(approve_withdrawal_request, request_id, str(callback.from_user.id))
+        
+        if success:
+            request = await asyncio.to_thread(get_withdrawal_request_by_id, request_id)
+            
+            def format_number(num):
+                try:
+                    return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+                except (ValueError, TypeError):
+                    return "0,00"
+            
+            text = (
+                f"✅ <b>Заявка одобрена!</b>\n\n"
+                f"Пользователь: {request.get('user_name', 'Пользователь')}\n"
+                f"Сумма: <b>{format_number(request['amount'])}</b> ₽\n\n"
+                f"Бонусы списаны. Свяжись с пользователем для уточнения способа выплаты."
+            )
+            
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
+            
+            # Уведомление пользователю
+            user_telegram_id = request.get("user_telegram_id")
+            if user_telegram_id:
+                try:
+                    user_text = (
+                        f"✅ <b>Твоя заявка на вывод одобрена!</b>\n\n"
+                        f"Сумма: <b>{format_number(request['amount'])}</b> ₽\n\n"
+                        f"Администратор свяжется с тобой для уточнения реквизитов и способа выплаты."
+                    )
+                    await bot.send_message(int(user_telegram_id), user_text, parse_mode="HTML")
+                except Exception as e:
+                    print(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
+        else:
+            await callback.message.edit_text(
+                "❌ Не удалось одобрить заявку. Возможно, недостаточно средств на балансе пользователя.",
+                reply_markup=None
+            )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ Ошибка при одобрении заявки: {str(e)}",
+            reply_markup=None
+        )
+
+@dp.callback_query(lambda c: c.data.startswith("admin_withdrawal_reject_"))
+async def admin_withdrawal_reject_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик отклонения заявки на вывод."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    request_id = safe_extract_id(callback.data, "admin_withdrawal_reject_")
+    if request_id is None:
+        await callback.message.edit_text(
+            "❌ Ошибка: неверный формат данных.",
+            reply_markup=None
+        )
+        return
+    
+    request = await asyncio.to_thread(get_withdrawal_request_by_id, request_id)
+    
+    if not request or request.get("status") != "processing":
+        await callback.message.edit_text(
+            "❌ Заявка не найдена или уже обработана.",
+            reply_markup=None
+        )
+        return
+    
+    # Сохраняем ID заявки в состоянии
+    await state.update_data(rejecting_request_id=request_id)
+    
+    text = (
+        f"❌ <b>Отклонить заявку на вывод?</b>\n\n"
+        f"Пользователь: {request.get('user_name', 'Пользователь')}\n"
+        f"Сумма: {request['amount']:,.2f} ₽\n\n"
+        f"Укажи причину отклонения:"
+    )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
+    await state.set_state(WithdrawalRejection.entering_reason)
+
+@dp.callback_query(lambda c: c.data.startswith("admin_withdrawal_complete_"))
+async def admin_withdrawal_complete_handler(callback: types.CallbackQuery):
+    """Обработчик завершения выплаты."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    request_id = safe_extract_id(callback.data, "admin_withdrawal_complete_")
+    if request_id is None:
+        await callback.message.edit_text(
+            "❌ Ошибка: неверный формат данных.",
+            reply_markup=None
+        )
+        return
+    
+    try:
+        success = await asyncio.to_thread(complete_withdrawal_request, request_id)
+        
+        if success:
+            text = "✅ <b>Выплата завершена!</b>\n\nСтатус заявки изменен на 'Выполнена'."
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
+        else:
+            await callback.message.edit_text(
+                "❌ Не удалось завершить выплату. Заявка не найдена или имеет неверный статус.",
+                reply_markup=None
+            )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ Ошибка при завершении выплаты: {str(e)}",
+            reply_markup=None
+        )
+
+@dp.message(WithdrawalRejection.entering_reason)
+async def process_withdrawal_rejection_reason(message: types.Message, state: FSMContext):
+    """Обработчик ввода причины отклонения заявки."""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    # Проверяем, не нажата ли кнопка
+    button_texts = ["📊 Моя статистика", "📦 Мои заказы", "👥 Управление", 
+                    "📈 Аналитика", "⚙️ Настройки", "👥 Пригласить друга", 
+                    "💸 Вывести бонусы", "❓ Помощь"]
+    if message.text in button_texts:
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    request_id = data.get("rejecting_request_id")
+    
+    if not request_id:
+        await message.answer(
+            "❌ Ошибка: данные не найдены.",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+        await state.clear()
+        return
+    
+    reason = message.text.strip()
+    
+    # Валидация длины
+    is_valid, error_msg = validate_text_length(reason, MAX_TEXT_LENGTH, "Причина отклонения")
+    if not is_valid:
+        await message.answer(
+            f"❌ {error_msg}\n\nВведи причину отклонения:",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+        return
+    
+    try:
+        success = await asyncio.to_thread(
+            reject_withdrawal_request,
+            request_id,
+            str(message.from_user.id),
+            reason
+        )
+        
+        if success:
+            request = await asyncio.to_thread(get_withdrawal_request_by_id, request_id)
+            
+            def format_number(num):
+                try:
+                    return f"{float(num):,.2f}".replace(',', ' ').replace('.', ',')
+                except (ValueError, TypeError):
+                    return "0,00"
+            
+            # Экранируем HTML в причине отклонения
+            safe_reason = sanitize_html(reason)
+            
+            text = (
+                f"❌ <b>Заявка отклонена</b>\n\n"
+                f"Пользователь: {request.get('user_name', 'Пользователь')}\n"
+                f"Сумма: {format_number(request['amount'])} ₽\n"
+                f"Причина: {safe_reason}"
+            )
+            
+            await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(message.from_user.id))
+            
+            # Уведомление пользователю
+            user_telegram_id = request.get("user_telegram_id")
+            if user_telegram_id:
+                try:
+                    # Экранируем HTML в причине отклонения
+                    safe_reason = sanitize_html(reason)
+                    
+                    user_text = (
+                        f"❌ <b>Твоя заявка на вывод отклонена</b>\n\n"
+                        f"Сумма: <b>{format_number(request['amount'])}</b> ₽\n"
+                        f"Причина: {safe_reason}\n\n"
+                        f"Бонусы возвращены на твой баланс."
+                    )
+                    await bot.send_message(int(user_telegram_id), user_text, parse_mode="HTML")
+                except Exception as e:
+                    print(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
+        else:
+            await message.answer(
+                "❌ Не удалось отклонить заявку. Заявка не найдена или уже обработана.",
+                reply_markup=get_keyboard(message.from_user.id)
+            )
+    except Exception as e:
+        await message.answer(
+            f"❌ Ошибка при отклонении заявки: {str(e)}",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+    
+    await state.clear()
+
 @dp.message(lambda message: message.text == "📈 Аналитика")
 async def analytics_handler(message: types.Message, state: FSMContext):
     """Обработчик кнопки 'Аналитика' (только для админов)."""
@@ -867,9 +1671,33 @@ async def analytics_handler(message: types.Message, state: FSMContext):
     await state.set_state(ParticipantAnalytics.waiting_for_participant_data)
     await message.answer(text, parse_mode="HTML", reply_markup=get_keyboard(user_id))
 
-@dp.message(ParticipantAnalytics.waiting_for_participant_data)
+# Список всех кнопок для исключения из обработки состояния аналитики
+ANALYTICS_BUTTON_TEXTS = [
+    "📊 Моя статистика", "📦 Мои заказы", "👥 Управление", 
+    "📈 Аналитика", "⚙️ Настройки", "👥 Пригласить друга", 
+    "💸 Вывести бонусы", "❓ Помощь", "💬 Чат с админом"
+]
+
+@dp.message(ParticipantAnalytics.waiting_for_participant_data, F.text.in_(ANALYTICS_BUTTON_TEXTS))
+async def process_analytics_button_in_state(message: types.Message, state: FSMContext):
+    """Обработчик кнопок в состоянии ввода данных аналитики - очищает состояние и обрабатывает кнопку."""
+    await state.clear()
+    
+    # Вызываем обработчик кнопки через диспетчер
+    from aiogram.types import Update
+    
+    new_update = Update(update_id=message.message_id, message=message)
+    
+    try:
+        await dp.feed_update(bot, new_update)
+    except Exception:
+        # Если feed_update не работает, состояние уже очищено
+        # Пользователю нужно будет нажать кнопку еще раз
+        pass
+
+@dp.message(ParticipantAnalytics.waiting_for_participant_data, ~F.text.in_(ANALYTICS_BUTTON_TEXTS))
 async def process_participant_analytics_input(message: types.Message, state: FSMContext):
-    """Обрабатывает ввод данных участника для аналитики."""
+    """Обрабатывает ввод данных участника для аналитики (не обрабатывает кнопки)."""
     user_id = message.from_user.id
     
     if not is_admin(user_id):
@@ -882,15 +1710,19 @@ async def process_participant_analytics_input(message: types.Message, state: FSM
         await message.answer("❌ Отменено.", reply_markup=get_keyboard(user_id))
         return
     
-    # Проверяем, не нажата ли кнопка
-    button_texts = ["📊 Моя статистика", "📦 Мои заказы", "👥 Управление", 
-                     "📈 Аналитика", "⚙️ Настройки", "👥 Пригласить друга", 
-                     "💸 Вывести бонусы", "❓ Помощь", "💬 Чат с админом"]
-    if message.text in button_texts:
-        await state.clear()
+    user_input = message.text.strip()
+    
+    # Валидация длины
+    max_length = max(MAX_OZON_ID_LENGTH, MAX_USERNAME_LENGTH)
+    is_valid, error_msg = validate_text_length(user_input, max_length, "Ввод")
+    if not is_valid:
+        await message.answer(
+            f"❌ {error_msg}\n\nПопробуй еще раз или отправь /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(user_id)
+        )
         return
     
-    user_input = message.text.strip()
     participant = None
     
     # Определяем тип ввода и ищем участника
@@ -911,8 +1743,11 @@ async def process_participant_analytics_input(message: types.Message, state: FSM
         participant = await asyncio.to_thread(find_participant_by_username, user_input)
     
     if not participant:
+        # Экранируем HTML в user_input
+        safe_user_input = sanitize_html(user_input)
+        
         await message.answer(
-            f"❌ Участник не найден по запросу: <code>{user_input}</code>\n\n"
+            f"❌ Участник не найден по запросу: <code>{safe_user_input}</code>\n\n"
             f"Проверь правильность ввода и попробуй еще раз.\n"
             f"Или отправь /cancel для отмены.",
             parse_mode="HTML",
@@ -960,29 +1795,37 @@ async def settings_handler(message: types.Message):
         return
     
     # Получаем текущие настройки бонусов
-    settings = await asyncio.to_thread(get_bonus_settings)
+    bonus_settings = await asyncio.to_thread(get_bonus_settings)
+    withdrawal_settings = await asyncio.to_thread(get_withdrawal_settings)
     
     text = (
         "⚙️ <b>Настройки</b>\n\n"
         "💰 <b>Настройки бонусной программы:</b>\n\n"
-        f"Количество уровней: <b>{settings.max_levels}</b>\n\n"
+        f"Количество уровней: <b>{bonus_settings.max_levels}</b>\n\n"
     )
     
     # Показываем уровень 0 (покупки самого участника)
-    level_0_percent = getattr(settings, 'level_0_percent', 0.0)
+    level_0_percent = getattr(bonus_settings, 'level_0_percent', 0.0)
     if level_0_percent is not None:
         text += f"Уровень 0 (покупки участника): <b>{level_0_percent}%</b>\n"
     
     # Показываем уровни 1-5
-    for level in range(1, min(settings.max_levels + 1, 6)):  # Ограничиваем до 5 уровней
-        percent = getattr(settings, f'level_{level}_percent', 0.0)
+    for level in range(1, min(bonus_settings.max_levels + 1, 6)):  # Ограничиваем до 5 уровней
+        percent = getattr(bonus_settings, f'level_{level}_percent', 0.0)
         if percent is not None:
             text += f"Уровень {level}: <b>{percent}%</b>\n"
+    
+    # Добавляем настройки вывода
+    text += (
+        "\n💸 <b>Настройки вывода бонусов:</b>\n\n"
+        f"Минимальная сумма вывода: <b>{withdrawal_settings.min_withdrawal_amount} ₽</b>\n"
+    )
     
     # Создаем inline-клавиатуру
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Изменить количество уровней", callback_data="bonus_edit_levels")],
         [InlineKeyboardButton(text="📝 Изменить проценты бонусов", callback_data="bonus_edit_percents")],
+        [InlineKeyboardButton(text="📝 Изменить минимальную сумму вывода", callback_data="withdrawal_edit_min_amount")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="bonus_settings_close")]
     ])
     
@@ -1126,7 +1969,7 @@ async def help_chat_with_admin_handler(callback: types.CallbackQuery):
         return
     
     admin_id = ADMIN_IDS[0]  # Берем первого админа
-    admin_info = await get_admin_contact_info(admin_id)
+    admin_info = await get_admin_contact_info(callback.message.bot, admin_id)
     
     if not admin_info:
         text = "❌ Не удалось получить контакт администратора. Попробуй позже."
@@ -1262,7 +2105,11 @@ async def bonus_edit_single_percent_handler(callback: types.CallbackQuery, state
         await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
         return
     
-    level = int(callback.data.split("_")[-1])
+    level = safe_extract_id(callback.data, "bonus_edit_level_")
+    if level is None or level < 0 or level > MAX_LEVELS:
+        await callback.answer("❌ Ошибка: неверный формат данных.", show_alert=True)
+        return
+    
     await callback.answer()
     await state.set_state(BonusSettings.editing_percent)
     await state.update_data(editing_level=level)
@@ -1294,8 +2141,10 @@ async def process_editing_levels(message: types.Message, state: FSMContext):
     
     try:
         levels = int(message.text.strip())
-        if levels < 1 or levels > 5:
-            await message.answer("❌ Количество уровней должно быть от 1 до 5. Попробуй еще раз:")
+        # Валидация диапазона
+        is_valid, error_msg = validate_numeric_range(float(levels), MIN_LEVELS, MAX_LEVELS, "Количество уровней")
+        if not is_valid:
+            await message.answer(f"❌ {error_msg} Попробуй еще раз:")
             return
         
         # Обновляем настройки
@@ -1324,8 +2173,10 @@ async def process_editing_percent(message: types.Message, state: FSMContext):
     
     try:
         percent = float(message.text.strip().replace(',', '.'))
-        if percent < 0 or percent > 100:
-            await message.answer("❌ Процент должен быть от 0 до 100. Попробуй еще раз:")
+        # Валидация диапазона
+        is_valid, error_msg = validate_numeric_range(percent, MIN_BONUS_PERCENT, MAX_BONUS_PERCENT, "Процент бонуса")
+        if not is_valid:
+            await message.answer(f"❌ {error_msg} Попробуй еще раз:")
             return
         
         # Обновляем настройки
@@ -1340,6 +2191,56 @@ async def process_editing_percent(message: types.Message, state: FSMContext):
         await state.clear()
     except ValueError:
         await message.answer("❌ Введи число (можно с точкой, например: 5.5). Попробуй еще раз:")
+
+@dp.callback_query(lambda c: c.data == "withdrawal_edit_min_amount")
+async def withdrawal_edit_min_amount_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Начать редактирование минимальной суммы вывода."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У тебя нет прав для выполнения этой команды.", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    settings = await asyncio.to_thread(get_withdrawal_settings)
+    
+    await state.set_state(WithdrawalSettings.editing_min_amount)
+    
+    text = (
+        "📝 <b>Редактирование минимальной суммы вывода</b>\n\n"
+        f"Текущее значение: <b>{settings.min_withdrawal_amount} ₽</b>\n\n"
+        "Введи новую минимальную сумму вывода (например: 500 для 500 ₽):"
+    )
+    
+    await callback.message.edit_text(text, parse_mode="HTML")
+
+@dp.message(WithdrawalSettings.editing_min_amount)
+async def process_editing_min_amount(message: types.Message, state: FSMContext):
+    """Обработать ввод минимальной суммы вывода."""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У тебя нет прав для выполнения этой команды.")
+        await state.clear()
+        return
+    
+    try:
+        min_amount = float(message.text.strip().replace(',', '.'))
+        # Валидация диапазона (максимальная сумма вывода как верхний предел)
+        is_valid, error_msg = validate_numeric_range(min_amount, 0.0, MAX_WITHDRAWAL_AMOUNT, "Минимальная сумма вывода")
+        if not is_valid:
+            await message.answer(f"❌ {error_msg} Попробуй еще раз:")
+            return
+        
+        # Обновляем настройки
+        await asyncio.to_thread(update_withdrawal_settings, {"min_withdrawal_amount": min_amount})
+        clear_withdrawal_settings_cache()
+        
+        await message.answer(
+            f"✅ Минимальная сумма вывода успешно изменена на <b>{min_amount} ₽</b>",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(message.from_user.id)
+        )
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введи число (можно с точкой, например: 500.5). Попробуй еще раз:")
 
 @dp.callback_query(lambda c: c.data == "leave_program_confirm")
 async def leave_program_confirm_handler(callback: types.CallbackQuery, state: FSMContext):
@@ -1425,6 +2326,15 @@ async def process_ozon_id(message: types.Message, state: FSMContext):
     user_input = message.text.strip()
     user = message.from_user
     
+    # Валидация длины входных данных
+    is_valid, error_msg = validate_text_length(user_input, MAX_OZON_ID_LENGTH * 3, "Ozon ID")
+    if not is_valid:
+        await message.answer(
+            f"❌ {error_msg}\n\nПопробуй еще раз:",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
+    
     # Извлекаем Ozon ID из ввода:
     # - Если есть тире, берем первые цифры до тире (например, "10054917-1093-1" -> "10054917")
     # - Если только цифры, используем как есть
@@ -1432,6 +2342,15 @@ async def process_ozon_id(message: types.Message, state: FSMContext):
         ozon_id = user_input.split("-")[0].strip()
     else:
         ozon_id = user_input
+    
+    # Валидация длины извлеченного Ozon ID
+    is_valid, error_msg = validate_text_length(ozon_id, MAX_OZON_ID_LENGTH, "Ozon ID")
+    if not is_valid:
+        await message.answer(
+            f"❌ {error_msg}\n\nПопробуй еще раз:",
+            reply_markup=get_keyboard(user.id)
+        )
+        return
     
     # Проверяем, что получили только цифры
     if not ozon_id.isdigit():

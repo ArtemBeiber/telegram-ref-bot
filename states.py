@@ -12,3 +12,13 @@ class LeavingProgram(StatesGroup):
 
 class ParticipantAnalytics(StatesGroup):
     waiting_for_participant_data = State()
+
+class Withdrawal(StatesGroup):
+    entering_amount = State()
+    confirming = State()
+
+class WithdrawalRejection(StatesGroup):
+    entering_reason = State()
+
+class WithdrawalSettings(StatesGroup):
+    editing_min_amount = State()

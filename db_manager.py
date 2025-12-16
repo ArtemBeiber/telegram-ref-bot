@@ -1,6 +1,7 @@
 # db_manager.py
 
 import os
+import json
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from datetime import datetime
@@ -189,7 +190,56 @@ class BonusTransaction(Base):
     returned_amount = Column(Float, nullable=True)  # Сумма возврата (если был частичный возврат)
     returned_at = Column(DateTime, nullable=True)  # Дата возврата
     
+    # Статус для вывода бонусов
+    status = Column(String, default="available")  # "available" или "withdrawn"
+    
 # >>> КОНЕЦ БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "bonus_transactions" <<<
+
+# >>> НАЧАЛО БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "withdrawal_settings" <<<
+class WithdrawalSettings(Base):
+    """Модель для хранения настроек вывода бонусов."""
+    
+    __tablename__ = "withdrawal_settings"
+    
+    id = Column(Integer, primary_key=True, index=True, default=1)  # Всегда одна запись с id=1
+    min_withdrawal_amount = Column(Float, default=100.0)  # Минимальная сумма вывода
+    days_between_withdrawals = Column(Integer, nullable=True)  # Через сколько дней можно подать новую заявку (null = без ограничений)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # Дата обновления
+    
+# >>> КОНЕЦ БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "withdrawal_settings" <<<
+
+# >>> НАЧАЛО БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "withdrawal_requests" <<<
+class WithdrawalRequest(Base):
+    """Модель для хранения заявок на вывод бонусов."""
+    
+    __tablename__ = "withdrawal_requests"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_ozon_id = Column(String, index=True)  # Ozon ID пользователя
+    user_telegram_id = Column(String, index=True)  # Telegram ID пользователя
+    amount = Column(Float)  # Сумма вывода
+    status = Column(String)  # "processing", "approved", "rejected", "completed"
+    admin_comment = Column(String, nullable=True)  # Причина отклонения/комментарий
+    processed_by = Column(String, nullable=True)  # Telegram ID админа, обработавшего заявку
+    created_at = Column(DateTime, default=datetime.utcnow)  # Дата создания заявки
+    processed_at = Column(DateTime, nullable=True)  # Дата одобрения/отклонения
+    completed_at = Column(DateTime, nullable=True)  # Дата завершения выплаты (статус "completed")
+    
+# >>> КОНЕЦ БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "withdrawal_requests" <<<
+
+# >>> НАЧАЛО БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "withdrawal_transactions" <<<
+class WithdrawalTransaction(Base):
+    """Модель для связи заявок на вывод с транзакциями бонусов."""
+    
+    __tablename__ = "withdrawal_transactions"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    withdrawal_request_id = Column(Integer, index=True)  # ID заявки на вывод
+    bonus_transaction_id = Column(Integer, index=True)  # ID транзакции бонуса
+    amount = Column(Float)  # Сумма списанного бонуса
+    created_at = Column(DateTime, default=datetime.utcnow)  # Дата списания
+    
+# >>> КОНЕЦ БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "withdrawal_transactions" <<<
 
 # >>> НАЧАЛО БЛОКА: ФУНКЦИИ ВЗАИМОДЕЙСТВИЯ С БД <<<
 def migrate_bonus_settings():
@@ -300,6 +350,33 @@ def migrate_bonus_transactions():
         print(f"❌ Ошибка миграции bonus_transactions: {e}")
         raise
 
+def migrate_bonus_transactions_status():
+    """Миграция: добавляет поле status в таблицу bonus_transactions для управления выводом бонусов."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Проверяем существующие колонки
+        cursor.execute("PRAGMA table_info(bonus_transactions)")
+        columns = [row[1] for row in cursor.fetchall()]
+        
+        # Добавляем поле status, если его нет
+        if 'status' not in columns:
+            cursor.execute("ALTER TABLE bonus_transactions ADD COLUMN status TEXT DEFAULT 'available'")
+            print("✅ Миграция: колонка status добавлена в bonus_transactions")
+            
+            # Для существующих записей устанавливаем status = 'available'
+            cursor.execute("UPDATE bonus_transactions SET status = 'available' WHERE status IS NULL")
+            conn.commit()
+        else:
+            print("ℹ️ Миграция: колонка status уже существует")
+        
+        conn.close()
+    except Exception as e:
+        print(f"❌ Ошибка миграции bonus_transactions status: {e}")
+        raise
+
 def create_database():
     """Создает базу данных и все определенные таблицы."""
     Base.metadata.create_all(bind=engine)
@@ -310,10 +387,16 @@ def create_database():
     migrate_participants()
     # Выполняем миграцию для добавления полей доступности к выводу в bonus_transactions
     migrate_bonus_transactions()
+    # Выполняем миграцию для добавления поля status в bonus_transactions
+    migrate_bonus_transactions_status()
     # Сбрасываем кэш настроек после миграции
     clear_bonus_settings_cache()
     # Инициализируем дефолтные настройки бонусов
     init_bonus_settings()
+    # Инициализируем дефолтные настройки вывода
+    init_withdrawal_settings()
+    # Очищаем кэш настроек вывода, чтобы загрузить их заново с правильным типом
+    clear_withdrawal_settings_cache()
 
 def get_db():
     """Генерирует сессию для взаимодействия с БД."""
@@ -866,6 +949,127 @@ def init_bonus_settings():
         raise e
     finally:
         db.close()
+
+# >>> ФУНКЦИИ ДЛЯ РАБОТЫ С НАСТРОЙКАМИ ВЫВОДА БОНУСОВ <<<
+_withdrawal_settings_cache = None
+
+class WithdrawalSettingsData:
+    """Простой класс для хранения настроек вывода без привязки к сессии SQLAlchemy."""
+    def __init__(self, min_withdrawal_amount: float, days_between_withdrawals: int | None, updated_at: datetime):
+        self.min_withdrawal_amount = min_withdrawal_amount
+        self.days_between_withdrawals = days_between_withdrawals
+        self.updated_at = updated_at
+
+def init_withdrawal_settings():
+    """Создает дефолтные настройки вывода бонусов при первом запуске."""
+    db = SessionLocal()
+    try:
+        existing = db.query(WithdrawalSettings).filter(WithdrawalSettings.id == 1).first()
+        if not existing:
+            default_settings = WithdrawalSettings(
+                id=1,
+                min_withdrawal_amount=100.0,
+                days_between_withdrawals=None  # Без ограничений по умолчанию
+            )
+            db.add(default_settings)
+            db.commit()
+            
+            # Отсоединяем объект от сессии перед кэшированием
+            db.expunge(default_settings)
+            
+            global _withdrawal_settings_cache
+            _withdrawal_settings_cache = default_settings
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+class WithdrawalSettingsData:
+    """Простой класс для хранения настроек вывода без привязки к сессии SQLAlchemy."""
+    def __init__(self, min_withdrawal_amount: float, days_between_withdrawals: int | None, updated_at: datetime):
+        self.min_withdrawal_amount = min_withdrawal_amount
+        self.days_between_withdrawals = days_between_withdrawals
+        self.updated_at = updated_at
+
+def get_withdrawal_settings():
+    """Получить текущие настройки вывода (с кэшированием для производительности)."""
+    global _withdrawal_settings_cache
+    
+    # Если есть кэш, возвращаем его
+    if _withdrawal_settings_cache is not None:
+        return _withdrawal_settings_cache
+    
+    db = SessionLocal()
+    try:
+        settings = db.query(WithdrawalSettings).filter(WithdrawalSettings.id == 1).first()
+        if not settings:
+            # Если настроек нет, создаем дефолтные
+            init_withdrawal_settings()
+            settings = db.query(WithdrawalSettings).filter(WithdrawalSettings.id == 1).first()
+        
+        # Извлекаем значения ДО закрытия сессии и создаем простой объект
+        if settings:
+            # Загружаем все значения пока сессия активна
+            min_amount = settings.min_withdrawal_amount
+            days_between = settings.days_between_withdrawals
+            updated = settings.updated_at
+            
+            # Создаем простой объект без привязки к сессии
+            settings_data = WithdrawalSettingsData(min_amount, days_between, updated)
+            
+            _withdrawal_settings_cache = settings_data
+            return settings_data
+        else:
+            return None
+    except Exception as e:
+        raise
+    finally:
+        db.close()
+
+def update_withdrawal_settings(settings: dict):
+    """Обновить настройки вывода."""
+    db = SessionLocal()
+    try:
+        existing = db.query(WithdrawalSettings).filter(WithdrawalSettings.id == 1).first()
+        if not existing:
+            existing = WithdrawalSettings(id=1)
+            db.add(existing)
+        
+        # Обновляем поля
+        if 'min_withdrawal_amount' in settings:
+            existing.min_withdrawal_amount = settings['min_withdrawal_amount']
+        if 'days_between_withdrawals' in settings:
+            existing.days_between_withdrawals = settings['days_between_withdrawals']
+        
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        
+        # Извлекаем значения ДО закрытия сессии и создаем простой объект
+        min_amount = existing.min_withdrawal_amount
+        days_between = existing.days_between_withdrawals
+        updated = existing.updated_at
+        
+        # Создаем простой объект без привязки к сессии
+        settings_data = WithdrawalSettingsData(min_amount, days_between, updated)
+        
+        # Сбрасываем кэш
+        global _withdrawal_settings_cache
+        _withdrawal_settings_cache = settings_data
+        
+        return settings_data
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+def clear_withdrawal_settings_cache():
+    """Сбросить кэш настроек вывода (использовать после обновления)."""
+    global _withdrawal_settings_cache
+    _withdrawal_settings_cache = None
+
+# >>> КОНЕЦ БЛОКА: ФУНКЦИИ ДЛЯ РАБОТЫ С НАСТРОЙКАМИ ВЫВОДА БОНУСОВ <<<
 
 def get_bonus_settings():
     """Получить текущие настройки бонусов (с кэшированием для производительности)."""
@@ -1573,6 +1777,501 @@ def set_last_order_date(order_date: datetime):
     finally:
         db.close()
 # >>> КОНЕЦ БЛОКА: ФУНКЦИИ ДЛЯ РАБОТЫ С НАСТРОЙКАМИ СИНХРОНИЗАЦИИ <<<
+
+# >>> ФУНКЦИИ ДЛЯ РАБОТЫ С ЗАЯВКАМИ НА ВЫВОД БОНУСОВ <<<
+def get_user_available_balance(ozon_id: str) -> float:
+    """Получить доступный баланс пользователя (только бонусы со статусом 'available').
+    
+    Args:
+        ozon_id: Ozon ID пользователя
+        
+    Returns:
+        float: Сумма доступных бонусов
+    """
+    db = SessionLocal()
+    try:
+        transactions = db.query(BonusTransaction).filter(
+            BonusTransaction.referrer_ozon_id == str(ozon_id),
+            BonusTransaction.status == "available"
+        ).all()
+        
+        total = sum(t.bonus_amount for t in transactions if t.bonus_amount)
+        return total
+    finally:
+        db.close()
+
+def get_user_total_balance(ozon_id: str) -> float:
+    """Получить общий баланс пользователя (все статусы).
+    
+    Args:
+        ozon_id: Ozon ID пользователя
+        
+    Returns:
+        float: Общая сумма бонусов
+    """
+    db = SessionLocal()
+    try:
+        transactions = db.query(BonusTransaction).filter(
+            BonusTransaction.referrer_ozon_id == str(ozon_id)
+        ).all()
+        
+        total = sum(t.bonus_amount for t in transactions if t.bonus_amount)
+        return total
+    finally:
+        db.close()
+
+def has_active_withdrawal_request(user_ozon_id: str) -> bool:
+    """Проверить, есть ли у пользователя активная заявка на вывод.
+    
+    Args:
+        user_ozon_id: Ozon ID пользователя
+        
+    Returns:
+        bool: True если есть активная заявка (статусы: 'processing', 'approved')
+    """
+    db = SessionLocal()
+    try:
+        active_request = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.user_ozon_id == str(user_ozon_id),
+            WithdrawalRequest.status.in_(["processing", "approved"])
+        ).first()
+        
+        return active_request is not None
+    finally:
+        db.close()
+
+def get_active_withdrawal_request(user_ozon_id: str) -> dict | None:
+    """Получить активную заявку пользователя.
+    
+    Args:
+        user_ozon_id: Ozon ID пользователя
+        
+    Returns:
+        dict | None: Данные заявки или None
+    """
+    db = SessionLocal()
+    try:
+        request = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.user_ozon_id == str(user_ozon_id),
+            WithdrawalRequest.status.in_(["processing", "approved"])
+        ).first()
+        
+        if request:
+            return {
+                "id": request.id,
+                "user_ozon_id": request.user_ozon_id,
+                "user_telegram_id": request.user_telegram_id,
+                "amount": request.amount,
+                "status": request.status,
+                "admin_comment": request.admin_comment,
+                "created_at": request.created_at,
+                "processed_at": request.processed_at
+            }
+        return None
+    finally:
+        db.close()
+
+def check_withdrawal_period(user_ozon_id: str) -> tuple[bool, str | None]:
+    """Проверить периодичность вывода (через сколько дней можно подать новую заявку).
+    
+    Args:
+        user_ozon_id: Ozon ID пользователя
+        
+    Returns:
+        tuple[bool, str | None]: (разрешено, сообщение об ошибке)
+    """
+    settings = get_withdrawal_settings()
+    
+    # Если лимит не установлен (null), разрешаем
+    if settings.days_between_withdrawals is None:
+        return True, None
+    
+    db = SessionLocal()
+    try:
+        # Получаем последнюю заявку со статусом "completed" или "rejected"
+        last_request = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.user_ozon_id == str(user_ozon_id),
+            WithdrawalRequest.status.in_(["completed", "rejected"])
+        ).order_by(WithdrawalRequest.processed_at.desc()).first()
+        
+        # Если это первая заявка, разрешаем
+        if not last_request:
+            return True, None
+        
+        # Вычисляем разницу дней
+        days_passed = (datetime.utcnow() - last_request.processed_at).days
+        
+        if days_passed < settings.days_between_withdrawals:
+            days_left = settings.days_between_withdrawals - days_passed
+            error_msg = f"Ты можешь подать новую заявку через {days_left} дней (после {last_request.processed_at.strftime('%d.%m.%Y')})"
+            return False, error_msg
+        
+        return True, None
+    finally:
+        db.close()
+
+def create_withdrawal_request(user_ozon_id: str, user_telegram_id: str, amount: float) -> dict:
+    """Создать заявку на вывод бонусов.
+    
+    Args:
+        user_ozon_id: Ozon ID пользователя
+        user_telegram_id: Telegram ID пользователя
+        amount: Сумма вывода
+        
+    Returns:
+        dict: Данные созданной заявки
+        
+    Raises:
+        ValueError: Если не пройдены проверки
+    """
+    db = SessionLocal()
+    try:
+        # Проверка активной заявки
+        if has_active_withdrawal_request(user_ozon_id):
+            raise ValueError("У тебя уже есть активная заявка на вывод. Дождись её обработки.")
+        
+        # Проверка минимальной суммы
+        settings = get_withdrawal_settings()
+        if amount < settings.min_withdrawal_amount:
+            raise ValueError(f"Минимальная сумма вывода: {settings.min_withdrawal_amount} ₽")
+        
+        # Проверка доступного баланса
+        available_balance = get_user_available_balance(user_ozon_id)
+        if amount > available_balance:
+            raise ValueError(f"Недостаточно средств. Доступный баланс: {available_balance} ₽")
+        
+        # Проверка периодичности
+        allowed, error_msg = check_withdrawal_period(user_ozon_id)
+        if not allowed:
+            raise ValueError(error_msg)
+        
+        # Создаем заявку
+        request = WithdrawalRequest(
+            user_ozon_id=str(user_ozon_id),
+            user_telegram_id=str(user_telegram_id),
+            amount=amount,
+            status="processing"
+        )
+        
+        db.add(request)
+        db.commit()
+        db.refresh(request)
+        
+        return {
+            "id": request.id,
+            "user_ozon_id": request.user_ozon_id,
+            "user_telegram_id": request.user_telegram_id,
+            "amount": request.amount,
+            "status": request.status,
+            "created_at": request.created_at
+        }
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+def get_user_withdrawal_requests(user_ozon_id: str) -> list:
+    """Получить список всех заявок пользователя.
+    
+    Args:
+        user_ozon_id: Ozon ID пользователя
+        
+    Returns:
+        list: Список заявок
+    """
+    db = SessionLocal()
+    try:
+        requests = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.user_ozon_id == str(user_ozon_id)
+        ).order_by(WithdrawalRequest.created_at.desc()).all()
+        
+        result = []
+        for req in requests:
+            result.append({
+                "id": req.id,
+                "amount": req.amount,
+                "status": req.status,
+                "admin_comment": req.admin_comment,
+                "created_at": req.created_at,
+                "processed_at": req.processed_at,
+                "completed_at": req.completed_at
+            })
+        
+        return result
+    finally:
+        db.close()
+
+def get_pending_withdrawal_requests() -> list:
+    """Получить список заявок со статусом 'processing' (для админов).
+    
+    Returns:
+        list: Список заявок
+    """
+    db = SessionLocal()
+    try:
+        requests = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.status == "processing"
+        ).order_by(WithdrawalRequest.created_at.asc()).all()
+        
+        result = []
+        for req in requests:
+            # Получаем информацию о пользователе
+            participant = db.query(Participant).filter(
+                Participant.ozon_id == req.user_ozon_id
+            ).first()
+            
+            result.append({
+                "id": req.id,
+                "user_ozon_id": req.user_ozon_id,
+                "user_telegram_id": req.user_telegram_id,
+                "user_name": participant.name if participant else None,
+                "user_username": participant.username if participant else None,
+                "amount": req.amount,
+                "status": req.status,
+                "created_at": req.created_at
+            })
+        
+        return result
+    finally:
+        db.close()
+
+def get_withdrawal_request_by_id(request_id: int) -> dict | None:
+    """Получить заявку по ID.
+    
+    Args:
+        request_id: ID заявки
+        
+    Returns:
+        dict | None: Данные заявки или None
+    """
+    db = SessionLocal()
+    try:
+        request = db.query(WithdrawalRequest).filter(WithdrawalRequest.id == request_id).first()
+        
+        if request:
+            # Получаем информацию о пользователе
+            participant = db.query(Participant).filter(
+                Participant.ozon_id == request.user_ozon_id
+            ).first()
+            
+            return {
+                "id": request.id,
+                "user_ozon_id": request.user_ozon_id,
+                "user_telegram_id": request.user_telegram_id,
+                "user_name": participant.name if participant else None,
+                "user_username": participant.username if participant else None,
+                "amount": request.amount,
+                "status": request.status,
+                "admin_comment": request.admin_comment,
+                "processed_by": request.processed_by,
+                "created_at": request.created_at,
+                "processed_at": request.processed_at,
+                "completed_at": request.completed_at
+            }
+        return None
+    finally:
+        db.close()
+
+def cancel_withdrawal_request(request_id: int, user_ozon_id: str) -> bool:
+    """Отменить заявку на вывод (только для статуса 'processing').
+    
+    Args:
+        request_id: ID заявки
+        user_ozon_id: Ozon ID пользователя (для проверки прав)
+        
+    Returns:
+        bool: True если отменена, False если не найдена или нельзя отменить
+    """
+    db = SessionLocal()
+    try:
+        request = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.id == request_id,
+            WithdrawalRequest.user_ozon_id == str(user_ozon_id),
+            WithdrawalRequest.status == "processing"
+        ).first()
+        
+        if not request:
+            return False
+        
+        # Удаляем заявку (бонусы не резервировались, так что просто удаляем)
+        db.delete(request)
+        db.commit()
+        
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+def reserve_and_withdraw_bonuses(user_ozon_id: str, amount: float, withdrawal_request_id: int) -> bool:
+    """Резервировать и списать бонусы по FIFO при одобрении заявки.
+    
+    Args:
+        user_ozon_id: Ozon ID пользователя
+        amount: Сумма для списания
+        withdrawal_request_id: ID заявки на вывод
+        
+    Returns:
+        bool: True если успешно, False если недостаточно средств
+    """
+    db = SessionLocal()
+    try:
+        # Получаем все транзакции со статусом "available" для пользователя
+        transactions = db.query(BonusTransaction).filter(
+            BonusTransaction.referrer_ozon_id == str(user_ozon_id),
+            BonusTransaction.status == "available"
+        ).order_by(BonusTransaction.created_at.asc()).all()
+        
+        remaining_amount = amount
+        used_transactions = []
+        
+        # Резервируем транзакции по FIFO
+        for transaction in transactions:
+            if remaining_amount <= 0:
+                break
+            
+            if transaction.bonus_amount:
+                if transaction.bonus_amount <= remaining_amount:
+                    # Используем всю транзакцию
+                    used_amount = transaction.bonus_amount
+                    remaining_amount -= used_amount
+                else:
+                    # Используем частично (но это не поддерживается в текущей структуре)
+                    # Для простоты используем всю транзакцию
+                    used_amount = remaining_amount
+                    remaining_amount = 0
+                
+                # Обновляем статус транзакции
+                transaction.status = "withdrawn"
+                
+                # Создаем запись в withdrawal_transactions
+                withdrawal_transaction = WithdrawalTransaction(
+                    withdrawal_request_id=withdrawal_request_id,
+                    bonus_transaction_id=transaction.id,
+                    amount=used_amount
+                )
+                db.add(withdrawal_transaction)
+                used_transactions.append(transaction)
+        
+        # Если не хватило средств, откатываем изменения
+        if remaining_amount > 0:
+            db.rollback()
+            return False
+        
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+def approve_withdrawal_request(request_id: int, admin_telegram_id: str) -> bool:
+    """Одобрить заявку на вывод.
+    
+    Args:
+        request_id: ID заявки
+        admin_telegram_id: Telegram ID админа
+        
+    Returns:
+        bool: True если успешно, False если не найдена или ошибка
+    """
+    db = SessionLocal()
+    try:
+        request = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.id == request_id,
+            WithdrawalRequest.status == "processing"
+        ).first()
+        
+        if not request:
+            return False
+        
+        # Резервируем и списываем бонусы
+        success = reserve_and_withdraw_bonuses(request.user_ozon_id, request.amount, request_id)
+        if not success:
+            return False
+        
+        # Обновляем статус заявки
+        request.status = "approved"
+        request.processed_by = str(admin_telegram_id)
+        request.processed_at = datetime.utcnow()
+        
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+def reject_withdrawal_request(request_id: int, admin_telegram_id: str, reason: str) -> bool:
+    """Отклонить заявку на вывод.
+    
+    Args:
+        request_id: ID заявки
+        admin_telegram_id: Telegram ID админа
+        reason: Причина отклонения
+        
+    Returns:
+        bool: True если успешно, False если не найдена
+    """
+    db = SessionLocal()
+    try:
+        request = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.id == request_id,
+            WithdrawalRequest.status == "processing"
+        ).first()
+        
+        if not request:
+            return False
+        
+        # Обновляем статус заявки (бонусы не резервировались, так что просто обновляем статус)
+        request.status = "rejected"
+        request.processed_by = str(admin_telegram_id)
+        request.processed_at = datetime.utcnow()
+        request.admin_comment = reason
+        
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+def complete_withdrawal_request(request_id: int) -> bool:
+    """Завершить выплату (изменить статус на 'completed').
+    
+    Args:
+        request_id: ID заявки
+        
+    Returns:
+        bool: True если успешно, False если не найдена
+    """
+    db = SessionLocal()
+    try:
+        request = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.id == request_id,
+            WithdrawalRequest.status == "approved"
+        ).first()
+        
+        if not request:
+            return False
+        
+        request.status = "completed"
+        request.completed_at = datetime.utcnow()
+        
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+# >>> КОНЕЦ БЛОКА: ФУНКЦИИ ДЛЯ РАБОТЫ С ЗАЯВКАМИ НА ВЫВОД БОНУСОВ <<<
 
 # >>> КОНЕЦ БЛОКА: ФУНКЦИИ ВЗАИМОДЕЙСТВИЯ С БД <<<
 
