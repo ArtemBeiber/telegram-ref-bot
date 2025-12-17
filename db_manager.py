@@ -184,14 +184,12 @@ class BonusTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)  # Дата начисления
     
     # Поля для управления доступностью к выводу
-    is_available_for_withdrawal = Column(Integer, default=0)  # Флаг доступности к выводу (0=заблокирован, 1=доступен)
     available_at = Column(DateTime, nullable=True)  # Дата, когда бонус станет доступным (created_at + 14 дней)
-    is_returned = Column(Integer, default=0)  # Флаг возврата товара (0=не возвращен, 1=возвращен)
     returned_amount = Column(Float, nullable=True)  # Сумма возврата (если был частичный возврат)
     returned_at = Column(DateTime, nullable=True)  # Дата возврата
     
     # Статус для вывода бонусов
-    status = Column(String, default="available")  # "available" или "withdrawn"
+    status = Column(String, default="frozen")  # "frozen", "available", "withdrawn" или "returned"
     
 # >>> КОНЕЦ БЛОКА: ОПРЕДЕЛЕНИЕ МОДЕЛИ ТАБЛИЦЫ "bonus_transactions" <<<
 
@@ -316,11 +314,9 @@ def migrate_bonus_transactions():
         cursor.execute("PRAGMA table_info(bonus_transactions)")
         columns = [row[1] for row in cursor.fetchall()]
         
-        # Добавляем новые поля, если их нет
+        # Добавляем новые поля, если их нет (старые поля is_available_for_withdrawal и is_returned больше не используются)
         new_fields = [
-            ("is_available_for_withdrawal", "INTEGER DEFAULT 0"),
             ("available_at", "DATETIME"),
-            ("is_returned", "INTEGER DEFAULT 0"),
             ("returned_amount", "REAL"),
             ("returned_at", "DATETIME")
         ]
@@ -333,12 +329,9 @@ def migrate_bonus_transactions():
                 print(f"ℹ️ Миграция: колонка {field_name} уже существует")
         
         # Для существующих записей устанавливаем available_at = created_at + 14 дней
-        # и is_available_for_withdrawal = 0 (заблокирован)
         cursor.execute("""
             UPDATE bonus_transactions 
-            SET available_at = datetime(created_at, '+14 days'),
-                is_available_for_withdrawal = 0,
-                is_returned = 0
+            SET available_at = datetime(created_at, '+14 days')
             WHERE available_at IS NULL
         """)
         
@@ -363,14 +356,27 @@ def migrate_bonus_transactions_status():
         
         # Добавляем поле status, если его нет
         if 'status' not in columns:
-            cursor.execute("ALTER TABLE bonus_transactions ADD COLUMN status TEXT DEFAULT 'available'")
+            cursor.execute("ALTER TABLE bonus_transactions ADD COLUMN status TEXT DEFAULT 'frozen'")
             print("✅ Миграция: колонка status добавлена в bonus_transactions")
-            
-            # Для существующих записей устанавливаем status = 'available'
-            cursor.execute("UPDATE bonus_transactions SET status = 'available' WHERE status IS NULL")
             conn.commit()
         else:
             print("ℹ️ Миграция: колонка status уже существует")
+        
+        # Обновляем существующие записи согласно новой логике статусов
+        # Устанавливаем статус на основе старых полей is_available_for_withdrawal и is_returned
+        cursor.execute("""
+            UPDATE bonus_transactions 
+            SET status = CASE
+                WHEN is_returned = 1 THEN 'returned'
+                WHEN status = 'withdrawn' THEN 'withdrawn'
+                WHEN is_available_for_withdrawal = 1 THEN 'available'
+                ELSE 'frozen'
+            END
+            WHERE status IS NULL OR status = 'available'
+        """)
+        
+        conn.commit()
+        print("✅ Миграция: статусы существующих записей обновлены")
         
         conn.close()
     except Exception as e:
@@ -876,6 +882,7 @@ def get_referrals_by_level(ozon_id: str, max_level: int = None) -> dict:
 
 def get_referrals_orders_stats(referral_ozon_ids: list) -> dict:
     """Получает статистику по заказам рефералов.
+    Учитывает только заказы, созданные после регистрации реферала в программе.
     
     Args:
         referral_ozon_ids: Список Ozon ID рефералов
@@ -888,16 +895,35 @@ def get_referrals_orders_stats(referral_ozon_ids: list) -> dict:
     
     db = SessionLocal()
     try:
+        # Получаем информацию о рефералах и их датах регистрации
+        participants = db.query(Participant).filter(
+            Participant.ozon_id.in_([str(oid) for oid in referral_ozon_ids])
+        ).all()
+        
+        # Создаем словарь: ozon_id -> registration_date
+        registration_dates = {}
+        for p in participants:
+            if p.registration_date:
+                registration_dates[str(p.ozon_id)] = p.registration_date
+        
         # Подсчитываем доставленные заказы рефералов и их сумму
+        # Фильтруем только заказы, созданные после регистрации реферала
         orders = db.query(Order).filter(
             Order.buyer_id.in_([str(oid) for oid in referral_ozon_ids]),
             Order.status == "delivered"
         ).all()
         
-        orders_count = len(orders)
+        orders_count = 0
         total_sum = 0.0
         
         for order in orders:
+            # Проверяем, что заказ создан после регистрации реферала
+            buyer_registration_date = registration_dates.get(str(order.buyer_id))
+            if buyer_registration_date and order.created_at:
+                if order.created_at < buyer_registration_date:
+                    continue  # Пропускаем заказ, созданный до регистрации реферала
+            
+            orders_count += 1
             try:
                 if order.price_amount:
                     price = float(order.price_amount)
@@ -1349,19 +1375,26 @@ def accrue_bonuses_for_order(posting_number: str, db: Session = None) -> bool:
         
         for bonus_data in bonuses:
             # Устанавливаем поля доступности к выводу
-            bonus_data["is_available_for_withdrawal"] = 0  # Заблокирован на 14 дней
+            bonus_data["status"] = "frozen"  # Заморожен на 14 дней
             bonus_data["available_at"] = available_at
-            bonus_data["is_returned"] = 0  # Не возвращен
             bonus_data["returned_amount"] = None
             bonus_data["returned_at"] = None
             
             transaction = BonusTransaction(**bonus_data)
             db.add(transaction)
         
-        db.commit()
+        # Коммитим только если сессия была создана внутри функции
+        # Если сессия передана извне, коммит будет в вызывающей функции
+        if should_close_db:
+            db.commit()
+        else:
+            # Используем flush для видимости в текущей транзакции
+            db.flush()
         return True
     except Exception as e:
-        db.rollback()
+        # Откатываем только если сессия была создана внутри функции
+        if should_close_db:
+            db.rollback()
         print(f"Ошибка при начислении бонусов за заказ {posting_number}: {e}")
         return False
     finally:
@@ -1547,9 +1580,10 @@ def process_order_return(posting_number: str, return_amount: float = None, db: S
     
     try:
         # Находим все бонусы, связанные с этим заказом
+        # Ищем бонусы со статусом "frozen" или "available" (не возвращенные и не выведенные)
         transactions = db.query(BonusTransaction).filter(
             BonusTransaction.posting_number == posting_number,
-            BonusTransaction.is_returned == 0  # Только не возвращенные бонусы
+            BonusTransaction.status.in_(["frozen", "available"])  # Только не возвращенные и не выведенные бонусы
         ).all()
         
         if not transactions:
@@ -1585,20 +1619,17 @@ def process_order_return(posting_number: str, return_amount: float = None, db: S
             # Рассчитываем сумму списания пропорционально возврату
             if return_ratio >= 1.0:
                 # Полный возврат - списываем весь бонус
-                transaction.is_returned = 1
+                transaction.status = "returned"
                 transaction.returned_amount = transaction.bonus_amount
                 transaction.returned_at = current_time
-                # Сбрасываем доступность к выводу
-                transaction.is_available_for_withdrawal = 0
             else:
                 # Частичный возврат - списываем пропорционально
                 returned_bonus_amount = transaction.bonus_amount * return_ratio
-                transaction.is_returned = 1
+                transaction.status = "returned"
                 transaction.returned_amount = returned_bonus_amount
                 transaction.returned_at = current_time
                 # Уменьшаем доступный бонус
                 transaction.bonus_amount = transaction.bonus_amount - returned_bonus_amount
-                # Если бонус был доступен, он остается доступным, но с уменьшенной суммой
         
         db.commit()
         return True
@@ -1631,10 +1662,9 @@ def check_and_update_bonus_availability(db: Session = None) -> int:
         current_time = datetime.utcnow()
         
         # Находим все бонусы, которые должны стать доступными
-        # (прошло 14 дней, еще не доступны, не возвращены)
+        # (прошло 14 дней, статус "frozen", не возвращены)
         transactions = db.query(BonusTransaction).filter(
-            BonusTransaction.is_available_for_withdrawal == 0,
-            BonusTransaction.is_returned == 0,
+            BonusTransaction.status == "frozen",
             BonusTransaction.available_at <= current_time
         ).all()
         
@@ -1650,18 +1680,18 @@ def check_and_update_bonus_availability(db: Session = None) -> int:
                 # Если заказ не возвращен (статус не "cancelled" после доставки)
                 # или статус все еще "delivered", разблокируем бонус
                 if order.status == "delivered":
-                    transaction.is_available_for_withdrawal = 1
+                    transaction.status = "available"
                     updated_count += 1
                 # Если заказ отменен после доставки - это возврат
                 elif order.status == "cancelled":
                     # Помечаем как возвращенный
-                    transaction.is_returned = 1
+                    transaction.status = "returned"
                     transaction.returned_amount = transaction.bonus_amount
                     transaction.returned_at = current_time
                     updated_count += 1
             else:
                 # Заказ не найден - считаем, что он доставлен (разблокируем)
-                transaction.is_available_for_withdrawal = 1
+                transaction.status = "available"
                 updated_count += 1
         
         db.commit()
@@ -1688,11 +1718,10 @@ def get_available_bonuses_for_withdrawal(ozon_id: str) -> float:
         # Сначала обновляем доступность бонусов
         check_and_update_bonus_availability(db)
         
-        # Получаем сумму доступных бонусов
+        # Получаем сумму доступных бонусов (только со статусом "available")
         transactions = db.query(BonusTransaction).filter(
             BonusTransaction.referrer_ozon_id == str(ozon_id),
-            BonusTransaction.is_available_for_withdrawal == 1,
-            BonusTransaction.is_returned == 0
+            BonusTransaction.status == "available"
         ).all()
         
         total = sum(t.bonus_amount for t in transactions if t.bonus_amount)

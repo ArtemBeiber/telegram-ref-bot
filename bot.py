@@ -858,12 +858,6 @@ async def process_withdrawal_amount(message: types.Message, state: FSMContext):
         amount_str = message.text.strip().replace(' ', '').replace(',', '.')
         amount = float(amount_str)
     except ValueError:
-        # #region agent log
-        try:
-            with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:process_withdrawal_amount", "message": "VALUE_ERROR", "data": {"message_text": message.text, "amount_str": amount_str}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
-        except: pass
-        # #endregion
         settings = await asyncio.to_thread(get_withdrawal_settings)
         await message.answer(
             f"❌ Неверный формат суммы. Введи число (например: 1000 или 1000.50).\n\n"
@@ -2447,9 +2441,11 @@ _sync_in_progress = False
 _sync_task: asyncio.Task = None
 _notification_task: asyncio.Task = None
 
-# Время синхронизации заказов: 13:00 по московскому времени каждый день
-SYNC_TIME_HOUR = 13
-SYNC_TIME_MINUTE = 0
+# Время синхронизации заказов: 13:00 и 19:30 по московскому времени каждый день
+SYNC_TIMES = [
+    (13, 0),   # 13:00 МСК
+    (19, 30),  # 19:30 МСК
+]
 
 async def perform_auto_sync(notify_admins: bool = False) -> bool:
     """
@@ -2478,19 +2474,7 @@ async def perform_auto_sync(notify_admins: bool = False) -> bool:
             print(f"✅ Автоматическая синхронизация завершена успешно. Добавлено заказов: {result.get('count', 0)}")
             
             # Уведомляем админов всегда, если запрошено (даже если заказов нет)
-            # #region agent log
-            try:
-                with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1109", "message": "BEFORE notify_admins check", "data": {"notify_admins": notify_admins, "result_count": result.get("count", 0)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
-            except: pass
-            # #endregion
             if notify_admins:
-                # #region agent log
-                try:
-                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1110", "message": "CALLING notify_admins_about_sync", "data": {"notify_admins": True}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
-                except: pass
-                # #endregion
                 await notify_admins_about_sync(result)
             
             return True
@@ -2513,12 +2497,6 @@ async def perform_auto_sync(notify_admins: bool = False) -> bool:
 async def notify_admins_about_sync(result: dict):
     """Отправляет уведомление админам об успешной синхронизации с детальной статистикой."""
     global bot
-    # #region agent log
-    try:
-        with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1129", "message": "notify_admins_about_sync ENTRY", "data": {"admin_ids": ADMIN_IDS, "bot_initialized": bot is not None}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C,E"}) + "\n")
-    except: pass
-    # #endregion
     try:
         period_start = result.get("period_start")
         period_end = result.get("period_end")
@@ -2590,42 +2568,12 @@ async def notify_admins_about_sync(result: dict):
                 f"{status_stats_text}"
             )
         
-        # #region agent log
-        try:
-            with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1203", "message": "BEFORE sending messages to admins", "data": {"admin_ids_count": len(ADMIN_IDS), "text_length": len(text)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C,D"}) + "\n")
-        except: pass
-        # #endregion
         for admin_id in ADMIN_IDS:
             try:
-                # #region agent log
-                try:
-                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1205", "message": "BEFORE send_message to admin", "data": {"admin_id": admin_id}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
-                except: pass
-                # #endregion
                 await bot.send_message(admin_id, text, parse_mode="HTML")
-                # #region agent log
-                try:
-                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1206", "message": "AFTER send_message to admin SUCCESS", "data": {"admin_id": admin_id}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
-                except: pass
-                # #endregion
             except Exception as e:
-                # #region agent log
-                try:
-                    with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1207", "message": "EXCEPTION sending message to admin", "data": {"admin_id": admin_id, "error": str(e), "error_type": type(e).__name__}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
-                except: pass
-                # #endregion
                 print(f"⚠️ Не удалось отправить уведомление админу {admin_id}: {e}")
     except Exception as e:
-        # #region agent log
-        try:
-            with open(r"c:\telegram-ref-bot\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({"id": f"log_{int(datetime.now().timestamp() * 1000)}", "timestamp": int(datetime.now().timestamp() * 1000), "location": "bot.py:1209", "message": "EXCEPTION in notify_admins_about_sync", "data": {"error": str(e), "error_type": type(e).__name__}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
-        except: pass
-        # #endregion
         print(f"⚠️ Ошибка при отправке уведомлений админам: {e}")
 
 async def notify_admins_about_sync_error(error_msg: str):
@@ -3138,7 +3086,7 @@ def should_sync_on_startup() -> bool:
     Проверяет, нужно ли выполнить синхронизацию при старте бота.
     Возвращает True, если:
     - Синхронизации еще не было, ИЛИ
-    - Сейчас уже после 13:00 МСК, а последняя синхронизация была вчера или раньше
+    - Сейчас уже после первого времени синхронизации (13:00) МСК, а последняя синхронизация была вчера или раньше
     """
     last_sync_time = get_last_sync_timestamp()
     
@@ -3148,10 +3096,12 @@ def should_sync_on_startup() -> bool:
     
     # Получаем текущее московское время
     moscow_time = get_moscow_time()
-    current_hour = moscow_time.hour
+    first_sync_hour, first_sync_minute = SYNC_TIMES[0]  # Первое время синхронизации (13:00)
+    current_time = moscow_time.replace(second=0, microsecond=0)
+    first_sync_time_today = moscow_time.replace(hour=first_sync_hour, minute=first_sync_minute, second=0, microsecond=0)
     
-    # Если сейчас уже после 13:00, проверяем, была ли сегодня синхронизация
-    if current_hour >= SYNC_TIME_HOUR:
+    # Если сейчас уже после первого времени синхронизации, проверяем, была ли сегодня синхронизация
+    if current_time >= first_sync_time_today:
         # Проверяем, была ли синхронизация сегодня
         last_sync_date = last_sync_time.date()
         today = moscow_time.date()
@@ -3159,7 +3109,7 @@ def should_sync_on_startup() -> bool:
         # Если последняя синхронизация была не сегодня, нужно синхронизировать
         return last_sync_date < today
     
-    # Если сейчас до 13:00, проверяем, была ли синхронизация вчера после 13:00
+    # Если сейчас до первого времени синхронизации, проверяем, была ли синхронизация вчера
     yesterday = moscow_time.date() - timedelta(days=1)
     last_sync_date = last_sync_time.date()
     
@@ -3169,31 +3119,39 @@ def should_sync_on_startup() -> bool:
 async def periodic_sync_task():
     """
     Фоновая задача для ежедневной синхронизации заказов.
-    Запускается в 13:00 по московскому времени каждый день.
+    Запускается в 13:00 и 19:30 по московскому времени каждый день.
     """
-    print(f"🔄 Запущена фоновая задача ежедневной синхронизации заказов (время синхронизации: {SYNC_TIME_HOUR}:{SYNC_TIME_MINUTE:02d} МСК)")
+    sync_times_str = ", ".join([f"{h:02d}:{m:02d}" for h, m in SYNC_TIMES])
+    print(f"🔄 Запущена фоновая задача ежедневной синхронизации заказов (время синхронизации: {sync_times_str} МСК)")
     
     while True:
         try:
             # Получаем текущее московское время
             moscow_time = get_moscow_time()
-            current_hour = moscow_time.hour
-            current_minute = moscow_time.minute
+            current_time = moscow_time.replace(second=0, microsecond=0)
             
-            # Целевое время синхронизации: 13:00 МСК
-            target_hour = SYNC_TIME_HOUR
-            target_minute = SYNC_TIME_MINUTE
+            # Находим ближайшее время синхронизации
+            target_datetime = None
+            min_seconds = float('inf')
             
-            # Вычисляем время до следующего запуска
-            if current_hour < target_hour or (current_hour == target_hour and current_minute < target_minute):
-                # Еще не наступило время синхронизации сегодня - ждем до 13:00
-                target_datetime = moscow_time.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-            else:
-                # Время уже прошло - следующий запуск будет завтра
-                target_datetime = (moscow_time + timedelta(days=1)).replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            for sync_hour, sync_minute in SYNC_TIMES:
+                # Создаем время синхронизации на сегодня
+                sync_time_today = moscow_time.replace(hour=sync_hour, minute=sync_minute, second=0, microsecond=0)
+                
+                # Если время уже прошло сегодня, берем на завтра
+                if sync_time_today <= current_time:
+                    sync_time_today = (moscow_time + timedelta(days=1)).replace(hour=sync_hour, minute=sync_minute, second=0, microsecond=0)
+                
+                # Вычисляем разницу в секундах
+                seconds_until_sync = (sync_time_today - current_time).total_seconds()
+                
+                # Если это ближайшее время, сохраняем его
+                if seconds_until_sync < min_seconds:
+                    min_seconds = seconds_until_sync
+                    target_datetime = sync_time_today
             
             # Вычисляем количество секунд до следующего запуска
-            wait_seconds = (target_datetime - moscow_time).total_seconds()
+            wait_seconds = (target_datetime - current_time).total_seconds()
             
             if wait_seconds > 0:
                 wait_hours = wait_seconds / 3600
@@ -3280,21 +3238,35 @@ async def main():
         print("🔄 Выполняем синхронизацию при старте (прошло достаточно времени или еще не было синхронизации)...")
         await perform_auto_sync(notify_admins=False)  # Не уведомляем при старте, чтобы не спамить
     else:
-        moscow_time = get_moscow_time()
-        last_sync_time = get_last_sync_timestamp()
-        if last_sync_time:
-            last_sync_date = last_sync_time.date()
-            today = moscow_time.date()
-            if last_sync_date == today:
-                print(f"⏰ Синхронизация уже была выполнена сегодня ({last_sync_time.strftime('%d.%m.%Y %H:%M')}), следующая будет в 13:00 МСК")
+            moscow_time = get_moscow_time()
+            last_sync_time = get_last_sync_timestamp()
+            current_time = moscow_time.replace(second=0, microsecond=0)
+            
+            # Находим ближайшее время синхронизации
+            next_sync_time = None
+            min_seconds = float('inf')
+            
+            for sync_hour, sync_minute in SYNC_TIMES:
+                sync_time_today = moscow_time.replace(hour=sync_hour, minute=sync_minute, second=0, microsecond=0)
+                if sync_time_today <= current_time:
+                    sync_time_today = (moscow_time + timedelta(days=1)).replace(hour=sync_hour, minute=sync_minute, second=0, microsecond=0)
+                
+                seconds_until_sync = (sync_time_today - current_time).total_seconds()
+                if seconds_until_sync < min_seconds:
+                    min_seconds = seconds_until_sync
+                    next_sync_time = sync_time_today
+            
+            if last_sync_time:
+                last_sync_date = last_sync_time.date()
+                today = moscow_time.date()
+                if last_sync_date == today:
+                    sync_times_str = ", ".join([f"{h:02d}:{m:02d}" for h, m in SYNC_TIMES])
+                    print(f"⏰ Синхронизация уже была выполнена сегодня ({last_sync_time.strftime('%d.%m.%Y %H:%M')}), следующая будет в {next_sync_time.strftime('%H:%M')} МСК")
+                else:
+                    print(f"⏰ Последняя синхронизация была {last_sync_date.strftime('%d.%m.%Y')}, следующая будет в {next_sync_time.strftime('%H:%M')} МСК")
             else:
-                print(f"⏰ Последняя синхронизация была {last_sync_date.strftime('%d.%m.%Y')}, следующая будет в 13:00 МСК")
-        else:
-            next_sync_time = moscow_time.replace(hour=SYNC_TIME_HOUR, minute=SYNC_TIME_MINUTE, second=0, microsecond=0)
-            if moscow_time.hour >= SYNC_TIME_HOUR:
-                next_sync_time += timedelta(days=1)
-            wait_hours = (next_sync_time - moscow_time).total_seconds() / 3600
-            print(f"ℹ️ Первая синхронизация будет выполнена в {next_sync_time.strftime('%d.%m.%Y %H:%M')} МСК (через {wait_hours:.1f} часов)")
+                wait_hours = (next_sync_time - moscow_time).total_seconds() / 3600
+                print(f"ℹ️ Первая синхронизация будет выполнена в {next_sync_time.strftime('%d.%m.%Y %H:%M')} МСК (через {wait_hours:.1f} часов)")
     
     # Запускаем фоновую задачу для периодической синхронизации
     _sync_task = asyncio.create_task(periodic_sync_task())

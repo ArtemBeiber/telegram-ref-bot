@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Any, Dict
 import json
+import time
 
 import requests 
 from sqlalchemy.orm import Session # Для работы с сессией DB
@@ -421,12 +422,31 @@ def update_orders_sheet():
         
         print(f"Обрабатываю день {current_date.strftime('%d.%m.%Y')}...")
         
-        # Запрашиваем заказы за один день
-        day_postings = fetch_new_orders_from_api(day_start, day_end)
+        # Запрашиваем заказы за один день с повторными попытками
+        day_postings = []
+        max_retries = 3
+        retry_delay = 5  # секунд
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                day_postings = fetch_new_orders_from_api(day_start, day_end)
+                if day_postings:
+                    break  # Успешно получили данные
+                elif attempt < max_retries:
+                    print(f"  Попытка {attempt} из {max_retries}: не получено данных. Повтор через {retry_delay} сек...")
+                    time.sleep(retry_delay)
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"  Попытка {attempt} из {max_retries}: ошибка - {e}. Повтор через {retry_delay} сек...")
+                    time.sleep(retry_delay)
+                else:
+                    print(f"  Все попытки исчерпаны для {current_date.strftime('%d.%m.%Y')}. Пропускаем день.")
         
         if day_postings:
             all_raw_postings.extend(day_postings)
             print(f"  Получено {len(day_postings)} заказов за {current_date.strftime('%d.%m.%Y')}")
+        else:
+            print(f"  Предупреждение: не удалось получить заказы за {current_date.strftime('%d.%m.%Y')} после {max_retries} попыток")
         
         # Переходим к следующему дню
         current_date += timedelta(days=1)
